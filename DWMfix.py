@@ -1,4 +1,6 @@
 import sys
+import os
+import winreg
 import win32gui
 import win32api
 import win32con
@@ -16,7 +18,7 @@ class StealthWorker(QtWidgets.QWidget):
             QtCore.Qt.WindowType.WindowDoesNotAcceptFocus
         )
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setWindowOpacity(0.01) # 1% видимости для DWM слоя
+        self.setWindowOpacity(0.01) # 1% видимости для DWM слоя (по умолчанию)
         
         self.base_width = 200
         self.base_height = 10
@@ -26,11 +28,18 @@ class StealthWorker(QtWidgets.QWidget):
         self.setFixedSize(self.base_width, self.base_height)
         
         self.offset = 0
+        self.target_monitor_idx = 1
         self.render_timer = QtCore.QTimer(self)
         # ВАЖНО: Используем repaint() для немедленной отрисовки в обход оптимизаций 24H2
         self.render_timer.timeout.connect(self.repaint)
         
-        self.move_to_secondary()
+        self.move_to_monitor()
+
+    def set_visibility(self, visible):
+        if visible:
+            self.setWindowOpacity(0.9)
+        else:
+            self.setWindowOpacity(0.01)
 
     def set_boost(self, enabled):
         self.is_boosted = enabled
@@ -38,18 +47,20 @@ class StealthWorker(QtWidgets.QWidget):
             self.setFixedSize(self.boost_size, self.boost_size)
         else:
             self.setFixedSize(self.base_width, self.base_height)
-        self.move_to_secondary()
+        self.move_to_monitor()
 
-    def move_to_secondary(self):
+    def set_monitor_idx(self, idx):
+        self.target_monitor_idx = idx
+        self.move_to_monitor()
+
+    def move_to_monitor(self):
         try:
-            monitors = win32api.EnumDisplayMonitors()
-            if len(monitors) > 1:
-                rect = monitors[1][2]
-                x = rect[0] + (rect[2] - rect[0]) // 2 - self.width() // 2
-                y = rect[1] + (rect[3] - rect[1]) // 2 - self.height() // 2
-                self.move(x, y)
-            else:
-                self.move(0, 0)
+            screens = QtGui.QGuiApplication.screens()
+            idx = min(self.target_monitor_idx, len(screens) - 1)
+            rect = screens[idx].geometry()
+            x = rect.x() + rect.width() // 2 - self.width() // 2
+            y = rect.y() + rect.height() // 2 - self.height() // 2
+            self.move(x, y)
         except:
             self.move(0, 0)
 
@@ -62,7 +73,7 @@ class StealthWorker(QtWidgets.QWidget):
 
         if self.is_boosted:
             # Режим Boost: Многоточечный градиент (высокая энтропия для DWM)
-            gradient = QtGui.QConicalGradient(self.rect().center(), self.offset)
+            gradient = QtGui.QConicalGradient(QtCore.QPointF(self.rect().center()), float(self.offset))
             # Добавляем 12 точек смены цвета для создания сложной структуры слоя
             for i in range(13):
                 hue = (self.offset + (i * 30)) % 360
@@ -89,7 +100,7 @@ class ControlPanel(QtWidgets.QWidget):
 
     def init_ui(self):
         self.setWindowTitle("DWM Aggressive Fixer")
-        self.setFixedSize(320, 250)
+        self.setFixedSize(320, 390)
         
         self.setStyleSheet("""
             QWidget { background-color: #0c0c0e; color: #d1d1d1; font-family: 'Segoe UI'; }
@@ -113,13 +124,31 @@ class ControlPanel(QtWidgets.QWidget):
         status_layout.addWidget(self.status_label)
         layout.addWidget(status_box)
 
-        self.ontop_check = QtWidgets.QCheckBox("Stay on Top (Control Panel)")
+        mon_layout = QtWidgets.QHBoxLayout()
+        mon_label = QtWidgets.QLabel("Target Monitor:")
+        self.mon_combo = QtWidgets.QComboBox()
+        self.update_monitor_list()
+        self.mon_combo.currentIndexChanged.connect(self.worker.set_monitor_idx)
+        mon_layout.addWidget(mon_label)
+        mon_layout.addWidget(self.mon_combo)
+        layout.addLayout(mon_layout)
+
+        self.visible_check = QtWidgets.QCheckBox("Show active area (visual check)")
+        self.visible_check.stateChanged.connect(lambda s: self.worker.set_visibility(s == 2))
+        layout.addWidget(self.visible_check)
+
+        self.ontop_check = QtWidgets.QCheckBox("Keep Control Panel on top")
         self.ontop_check.stateChanged.connect(self.toggle_ontop)
         layout.addWidget(self.ontop_check)
 
-        self.boost_check = QtWidgets.QCheckBox("BOOST MODE (Complex Rendering)")
+        self.boost_check = QtWidgets.QCheckBox("Boost Mode (use if stutter persists)")
         self.boost_check.stateChanged.connect(lambda s: self.worker.set_boost(s == 2))
         layout.addWidget(self.boost_check)
+        
+        self.startup_check = QtWidgets.QCheckBox("Start with Windows")
+        self.startup_check.setChecked(self.is_startup_enabled())
+        self.startup_check.stateChanged.connect(self.toggle_startup)
+        layout.addWidget(self.startup_check)
 
         self.btn_toggle = QtWidgets.QPushButton("STOP FIX")
         self.btn_toggle.clicked.connect(self.toggle_fix)
@@ -150,6 +179,61 @@ class ControlPanel(QtWidgets.QWidget):
         self.hide()
         if self.tray_icon.isVisible():
             self.tray_icon.showMessage("DWM Fixer", "Active (Constant Mode)", QtWidgets.QSystemTrayIcon.MessageIcon.Information, 1500)
+
+    def update_monitor_list(self):
+        self.mon_combo.clear()
+        try:
+            screens = QtGui.QGuiApplication.screens()
+            for i, screen in enumerate(screens):
+                rect = screen.geometry()
+                ratio = screen.devicePixelRatio()
+                w = int(rect.width() * ratio)
+                h = int(rect.height() * ratio)
+                self.mon_combo.addItem(f"Display {i} ({w}x{h})")
+            if len(screens) > 1:
+                self.mon_combo.setCurrentIndex(1)
+        except Exception:
+            self.mon_combo.addItem("Default Display")
+
+    def is_startup_enabled(self):
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
+            value, _ = winreg.QueryValueEx(key, "DWMfix")
+            winreg.CloseKey(key)
+            return True
+        except WindowsError:
+            return False
+
+    def toggle_startup(self, state):
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        
+        if getattr(sys, 'frozen', False):
+            # Если программа скомпилирована в .exe
+            exe_path = f'"{sys.executable}" --startup'
+        else:
+            # Если запускается как скрипт .py
+            script_path = os.path.abspath(sys.argv[0])
+            exe_path = f'"{sys.executable}" "{script_path}" --startup'
+            
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_ALL_ACCESS)
+            if state == 2:
+                winreg.SetValueEx(key, "DWMfix", 0, winreg.REG_SZ, exe_path)
+                # Принудительно удаляем блокировку из диспетчера задач (обход защиты Windows 11)
+                try:
+                    approve_key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run", 0, winreg.KEY_ALL_ACCESS)
+                    winreg.DeleteValue(approve_key, "DWMfix")
+                    winreg.CloseKey(approve_key)
+                except Exception:
+                    pass
+            else:
+                try:
+                    winreg.DeleteValue(key, "DWMfix")
+                except FileNotFoundError:
+                    pass
+            winreg.CloseKey(key)
+        except Exception:
+            pass
 
     def show_and_raise(self):
         self.showNormal()
@@ -195,6 +279,11 @@ if __name__ == "__main__":
     
     worker = StealthWorker()
     panel = ControlPanel(worker)
-    panel.show()
+    
+    if "--startup" not in sys.argv:
+        panel.show()
+    else:
+        if panel.tray_icon.isVisible():
+            panel.tray_icon.showMessage("DWM Fixer", "Started with Windows. Active in background.", QtWidgets.QSystemTrayIcon.MessageIcon.Information, 1500)
     
     sys.exit(app.exec())
