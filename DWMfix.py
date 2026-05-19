@@ -6,9 +6,64 @@ import win32api
 import win32con
 from PyQt6 import QtCore, QtGui, QtWidgets
 
+class CheckableComboBox(QtWidgets.QComboBox):
+    """Выпадающий список с чекбоксами для выбора нескольких мониторов."""
+    itemChecked = QtCore.pyqtSignal(int, bool)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setModel(QtGui.QStandardItemModel(self))
+        self.view().pressed.connect(self.handle_item_pressed)
+
+    def handle_item_pressed(self, index):
+        item = self.model().itemFromIndex(index)
+        if item.checkState() == QtCore.Qt.CheckState.Checked:
+            item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+        else:
+            item.setCheckState(QtCore.Qt.CheckState.Checked)
+        
+        is_checked = (item.checkState() == QtCore.Qt.CheckState.Checked)
+        self.itemChecked.emit(index.row(), is_checked)
+        self.update() # Перерисовываем для обновления отображаемого текста
+
+    def hidePopup(self):
+        # Если кликнули внутри выпадающего списка (курсор мыши над ним), не закрываем
+        view = self.view()
+        if view and (view.underMouse() or view.viewport().underMouse()):
+            return
+        super().hidePopup()
+
+    def get_display_text(self):
+        checked_texts = []
+        for i in range(self.count()):
+            item = self.model().item(i)
+            if item and item.checkState() == QtCore.Qt.CheckState.Checked:
+                txt = item.text()
+                if "Display" in txt:
+                    parts = txt.split(" ")
+                    if len(parts) > 1:
+                        checked_texts.append(parts[1])
+                else:
+                    checked_texts.append(str(i))
+        
+        if not checked_texts:
+            return "None"
+        elif len(checked_texts) == 1:
+            return f"Display {checked_texts[0]}"
+        else:
+            return f"Displays: {', '.join(checked_texts)}"
+
+    def paintEvent(self, event):
+        painter = QtWidgets.QStylePainter(self)
+        option = QtWidgets.QStyleOptionComboBox()
+        self.initStyleOption(option)
+        option.currentText = self.get_display_text()
+        painter.drawComplexControl(QtWidgets.QStyle.ComplexControl.CC_ComboBox, option)
+        painter.drawControl(QtWidgets.QStyle.ControlElement.CE_ComboBoxLabel, option)
+
 class StealthWorker(QtWidgets.QWidget):
-    """Графически активное окно для принудительной стимуляции DWM."""
-    def __init__(self):
+    """Графически активное окно для принудительной стимуляции DWM на конкретном мониторе."""
+    def __init__(self, target_monitor_idx):
         super().__init__()
         self.setWindowFlags(
             QtCore.Qt.WindowType.FramelessWindowHint |
@@ -24,13 +79,12 @@ class StealthWorker(QtWidgets.QWidget):
         self.base_height = 10
         self.boost_size = 400
         self.is_boosted = False
+        self.target_monitor_idx = target_monitor_idx
         
         self.setFixedSize(self.base_width, self.base_height)
         
         self.offset = 0
-        self.target_monitor_idx = 1
         self.render_timer = QtCore.QTimer(self)
-        # ВАЖНО: Используем repaint() для немедленной отрисовки в обход оптимизаций 24H2
         self.render_timer.timeout.connect(self.repaint)
         
         self.move_to_monitor()
@@ -49,18 +103,16 @@ class StealthWorker(QtWidgets.QWidget):
             self.setFixedSize(self.base_width, self.base_height)
         self.move_to_monitor()
 
-    def set_monitor_idx(self, idx):
-        self.target_monitor_idx = idx
-        self.move_to_monitor()
-
     def move_to_monitor(self):
         try:
             screens = QtGui.QGuiApplication.screens()
-            idx = min(self.target_monitor_idx, len(screens) - 1)
-            rect = screens[idx].geometry()
-            x = rect.x() + rect.width() // 2 - self.width() // 2
-            y = rect.y() + rect.height() // 2 - self.height() // 2
-            self.move(x, y)
+            if self.target_monitor_idx < len(screens):
+                rect = screens[self.target_monitor_idx].geometry()
+                x = rect.x() + rect.width() // 2 - self.width() // 2
+                y = rect.y() + rect.height() // 2 - self.height() // 2
+                self.move(x, y)
+            else:
+                self.move(0, 0)
         except:
             self.move(0, 0)
 
@@ -72,15 +124,12 @@ class StealthWorker(QtWidgets.QWidget):
         self.offset = (self.offset + 4) % 360
 
         if self.is_boosted:
-            # Режим Boost: Многоточечный градиент (высокая энтропия для DWM)
             gradient = QtGui.QConicalGradient(QtCore.QPointF(self.rect().center()), float(self.offset))
-            # Добавляем 12 точек смены цвета для создания сложной структуры слоя
             for i in range(13):
                 hue = (self.offset + (i * 30)) % 360
                 gradient.setColorAt(i / 12, QtGui.QColor.fromHsv(hue, 200, 255))
             painter.fillRect(self.rect(), gradient)
         else:
-            # Обычный режим: Стандартный бегущий градиент
             gradient = QtGui.QLinearGradient(0, 0, self.width(), self.height())
             color1 = QtGui.QColor.fromHsv(self.offset, 200, 255)
             color2 = QtGui.QColor.fromHsv((self.offset + 180) % 360, 200, 255)
@@ -89,9 +138,14 @@ class StealthWorker(QtWidgets.QWidget):
             painter.fillRect(self.rect(), gradient)
 
 class ControlPanel(QtWidgets.QWidget):
-    def __init__(self, worker):
+    def __init__(self):
         super().__init__()
-        self.worker = worker
+        self.workers = {}  # {monitor_idx: StealthWorker}
+        self.active_monitors = set()
+        self.is_boosted = False
+        self.is_visible = False
+        self.is_active = True
+        
         self.init_ui()
         self.init_tray()
         
@@ -106,9 +160,21 @@ class ControlPanel(QtWidgets.QWidget):
             QWidget { background-color: #0c0c0e; color: #d1d1d1; font-family: 'Segoe UI'; }
             QPushButton { 
                 background-color: #1a1a1f; border: 1px solid #2a2a2f; 
-                padding: 12px; border-radius: 6px; font-weight: bold;
+                padding: 10px; border-radius: 6px; font-weight: bold;
             }
             QPushButton:hover { background-color: #24242b; }
+            QComboBox { 
+                background-color: #1a1a1f; border: 1px solid #2a2a2f; 
+                padding: 8px; border-radius: 6px; font-weight: bold;
+            }
+            QComboBox::drop-down { border: none; }
+            QComboBox QAbstractItemView {
+                background-color: #121216;
+                border: 1px solid #2a2a2f;
+                selection-background-color: #1a1a1f;
+                selection-color: #00c8ff;
+                outline: none;
+            }
             QCheckBox { margin: 5px 0; font-weight: 500; }
             #status_box { background-color: #121216; border-radius: 8px; padding: 12px; margin-bottom: 10px; }
         """)
@@ -124,17 +190,18 @@ class ControlPanel(QtWidgets.QWidget):
         status_layout.addWidget(self.status_label)
         layout.addWidget(status_box)
 
+        # Выбор мониторов через CheckableComboBox
         mon_layout = QtWidgets.QHBoxLayout()
         mon_label = QtWidgets.QLabel("Target Monitor:")
-        self.mon_combo = QtWidgets.QComboBox()
+        self.mon_combo = CheckableComboBox(self)
         self.update_monitor_list()
-        self.mon_combo.currentIndexChanged.connect(self.worker.set_monitor_idx)
+        self.mon_combo.itemChecked.connect(self.on_monitor_toggled)
         mon_layout.addWidget(mon_label)
         mon_layout.addWidget(self.mon_combo)
         layout.addLayout(mon_layout)
 
         self.visible_check = QtWidgets.QCheckBox("Show active area (visual check)")
-        self.visible_check.stateChanged.connect(lambda s: self.worker.set_visibility(s == 2))
+        self.visible_check.stateChanged.connect(self.toggle_visibility)
         layout.addWidget(self.visible_check)
 
         self.ontop_check = QtWidgets.QCheckBox("Keep Control Panel on top")
@@ -142,7 +209,7 @@ class ControlPanel(QtWidgets.QWidget):
         layout.addWidget(self.ontop_check)
 
         self.boost_check = QtWidgets.QCheckBox("Boost Mode (use if stutter persists)")
-        self.boost_check.stateChanged.connect(lambda s: self.worker.set_boost(s == 2))
+        self.boost_check.stateChanged.connect(self.toggle_boost)
         layout.addWidget(self.boost_check)
         
         self.startup_check = QtWidgets.QCheckBox("Start with Windows")
@@ -184,16 +251,74 @@ class ControlPanel(QtWidgets.QWidget):
         self.mon_combo.clear()
         try:
             screens = QtGui.QGuiApplication.screens()
+            model = self.mon_combo.model()
             for i, screen in enumerate(screens):
                 rect = screen.geometry()
                 ratio = screen.devicePixelRatio()
                 w = int(rect.width() * ratio)
                 h = int(rect.height() * ratio)
-                self.mon_combo.addItem(f"Display {i} ({w}x{h})")
-            if len(screens) > 1:
-                self.mon_combo.setCurrentIndex(1)
+                is_primary = (i == 0)
+                
+                label = f"Display {i} ({w}x{h})"
+                if is_primary:
+                    label += " [Primary]"
+                    
+                item = QtGui.QStandardItem(label)
+                item.setCheckable(True)
+                
+                # По умолчанию выбираем второстепенные мониторы. Если монитор один, то выбираем его.
+                should_check = not is_primary or len(screens) == 1
+                if should_check:
+                    item.setCheckState(QtCore.Qt.CheckState.Checked)
+                    self.active_monitors.add(i)
+                else:
+                    item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+                    
+                model.appendRow(item)
         except Exception:
-            self.mon_combo.addItem("Default Display")
+            model = self.mon_combo.model()
+            item = QtGui.QStandardItem("Default Display")
+            item.setCheckable(True)
+            item.setCheckState(QtCore.Qt.CheckState.Checked)
+            model.appendRow(item)
+            self.active_monitors.add(0)
+
+    def on_monitor_toggled(self, idx, checked):
+        if checked:
+            self.active_monitors.add(idx)
+            if self.is_active:
+                self.start_worker_for_monitor(idx)
+        else:
+            self.active_monitors.discard(idx)
+            self.stop_worker_for_monitor(idx)
+
+    def start_worker_for_monitor(self, idx):
+        if idx not in self.workers:
+            worker = StealthWorker(idx)
+            worker.set_boost(self.is_boosted)
+            worker.set_visibility(self.is_visible)
+            worker.render_timer.start(16)
+            worker.show()
+            worker.raise_()
+            self.workers[idx] = worker
+
+    def stop_worker_for_monitor(self, idx):
+        if idx in self.workers:
+            worker = self.workers[idx]
+            worker.render_timer.stop()
+            worker.hide()
+            worker.deleteLater()
+            del self.workers[idx]
+
+    def toggle_visibility(self, state):
+        self.is_visible = (state == 2)
+        for worker in self.workers.values():
+            worker.set_visibility(self.is_visible)
+
+    def toggle_boost(self, state):
+        self.is_boosted = (state == 2)
+        for worker in self.workers.values():
+            worker.set_boost(self.is_boosted)
 
     def is_startup_enabled(self):
         try:
@@ -208,10 +333,8 @@ class ControlPanel(QtWidgets.QWidget):
         key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
         
         if getattr(sys, 'frozen', False):
-            # Если программа скомпилирована в .exe
             exe_path = f'"{sys.executable}" --startup'
         else:
-            # Если запускается как скрипт .py
             script_path = os.path.abspath(sys.argv[0])
             exe_path = f'"{sys.executable}" "{script_path}" --startup'
             
@@ -219,7 +342,6 @@ class ControlPanel(QtWidgets.QWidget):
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_ALL_ACCESS)
             if state == 2:
                 winreg.SetValueEx(key, "DWMfix", 0, winreg.REG_SZ, exe_path)
-                # Принудительно удаляем блокировку из диспетчера задач (обход защиты Windows 11)
                 try:
                     approve_key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run", 0, winreg.KEY_ALL_ACCESS)
                     winreg.DeleteValue(approve_key, "DWMfix")
@@ -248,23 +370,23 @@ class ControlPanel(QtWidgets.QWidget):
         self.show()
 
     def toggle_fix(self):
-        if self.worker.render_timer.isActive():
+        if self.is_active:
             self.stop_fix()
         else:
             self.start_fix()
 
     def start_fix(self):
-        self.worker.render_timer.start(16)
-        # Принудительный "пинок" в иерархии окон
-        self.worker.show()
-        self.worker.raise_()
+        self.is_active = True
+        for idx in self.active_monitors:
+            self.start_worker_for_monitor(idx)
         self.status_label.setText("STATUS: ACTIVE")
         self.status_label.setStyleSheet("color: #00c8ff; font-weight: bold;")
         self.btn_toggle.setText("STOP FIX")
 
     def stop_fix(self):
-        self.worker.render_timer.stop()
-        self.worker.hide()
+        self.is_active = False
+        for idx in list(self.workers.keys()):
+            self.stop_worker_for_monitor(idx)
         self.status_label.setText("STATUS: STOPPED")
         self.status_label.setStyleSheet("color: #ff4444; font-weight: bold;")
         self.btn_toggle.setText("START FIX")
@@ -277,8 +399,7 @@ if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     
-    worker = StealthWorker()
-    panel = ControlPanel(worker)
+    panel = ControlPanel()
     
     if "--startup" not in sys.argv:
         panel.show()
