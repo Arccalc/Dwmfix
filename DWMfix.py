@@ -6,6 +6,14 @@ import win32api
 import win32con
 from PyQt6 import QtCore, QtGui, QtWidgets
 
+def get_resource_path(relative_path):
+    """Возвращает абсолютный путь к ресурсу, учитывая упаковку PyInstaller."""
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_path, relative_path)
+
 class CheckableComboBox(QtWidgets.QComboBox):
     """Выпадающий список с чекбоксами для выбора нескольких мониторов."""
     itemChecked = QtCore.pyqtSignal(int, bool)
@@ -63,6 +71,8 @@ class CheckableComboBox(QtWidgets.QComboBox):
 
 class StealthWorker(QtWidgets.QWidget):
     """Графически активное окно для принудительной стимуляции DWM на конкретном мониторе."""
+    positionChanged = QtCore.pyqtSignal(int, QtCore.QPoint)
+
     def __init__(self, target_monitor_idx):
         super().__init__()
         self.setWindowFlags(
@@ -81,6 +91,9 @@ class StealthWorker(QtWidgets.QWidget):
         self.is_boosted = False
         self.target_monitor_idx = target_monitor_idx
         
+        self.custom_pos = None
+        self.draggable = False
+        
         self.setFixedSize(self.base_width, self.base_height)
         
         self.offset = 0
@@ -89,11 +102,24 @@ class StealthWorker(QtWidgets.QWidget):
         
         self.move_to_monitor()
 
-    def set_visibility(self, visible):
-        if visible:
+    def update_opacity(self):
+        if self.draggable:
             self.setWindowOpacity(0.9)
         else:
             self.setWindowOpacity(0.01)
+
+    def set_draggable(self, enabled):
+        self.draggable = enabled
+        if enabled:
+            # Разрешаем взаимодействие для перетаскивания
+            self.setWindowFlags(self.windowFlags() & ~QtCore.Qt.WindowType.WindowTransparentForInput)
+            self.setCursor(QtCore.Qt.CursorShape.SizeAllCursor)
+        else:
+            # Возвращаем полную прозрачность для кликов
+            self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowType.WindowTransparentForInput)
+            self.unsetCursor()
+        self.update_opacity()
+        self.show()
 
     def set_boost(self, enabled):
         self.is_boosted = enabled
@@ -104,6 +130,10 @@ class StealthWorker(QtWidgets.QWidget):
         self.move_to_monitor()
 
     def move_to_monitor(self):
+        if self.custom_pos is not None:
+            self.move(self.custom_pos)
+            return
+
         try:
             screens = QtGui.QGuiApplication.screens()
             if self.target_monitor_idx < len(screens):
@@ -115,6 +145,19 @@ class StealthWorker(QtWidgets.QWidget):
                 self.move(0, 0)
         except:
             self.move(0, 0)
+
+    def mousePressEvent(self, event):
+        if self.draggable and event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self.drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self.draggable and event.buttons() == QtCore.Qt.MouseButton.LeftButton:
+            new_pos = event.globalPosition().toPoint() - self.drag_pos
+            self.move(new_pos)
+            self.custom_pos = new_pos
+            self.positionChanged.emit(self.target_monitor_idx, new_pos)
+            event.accept()
 
     def paintEvent(self, event):
         if not self.render_timer.isActive():
@@ -143,8 +186,9 @@ class ControlPanel(QtWidgets.QWidget):
         self.workers = {}  # {monitor_idx: StealthWorker}
         self.active_monitors = set()
         self.is_boosted = False
-        self.is_visible = False
         self.is_active = True
+        self.is_adjusting = False
+        self.custom_positions = {}
         
         self.init_ui()
         self.init_tray()
@@ -154,7 +198,7 @@ class ControlPanel(QtWidgets.QWidget):
 
     def init_ui(self):
         self.setWindowTitle("DWM Aggressive Fixer")
-        self.setFixedSize(320, 390)
+        self.setFixedSize(320, 395)
         
         self.setStyleSheet("""
             QWidget { background-color: #0c0c0e; color: #d1d1d1; font-family: 'Segoe UI'; }
@@ -181,14 +225,14 @@ class ControlPanel(QtWidgets.QWidget):
 
         layout = QtWidgets.QVBoxLayout()
         
-        status_box = QtWidgets.QFrame()
-        status_box.setObjectName("status_box")
-        status_layout = QtWidgets.QVBoxLayout(status_box)
+        self.status_box = QtWidgets.QFrame()
+        self.status_box.setObjectName("status_box")
+        status_layout = QtWidgets.QVBoxLayout(self.status_box)
         self.status_label = QtWidgets.QLabel("STATUS: INITIALIZING")
         self.status_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.status_label.setStyleSheet("font-size: 15px; font-weight: bold;")
         status_layout.addWidget(self.status_label)
-        layout.addWidget(status_box)
+        layout.addWidget(self.status_box)
 
         # Выбор мониторов через CheckableComboBox
         mon_layout = QtWidgets.QHBoxLayout()
@@ -200,9 +244,9 @@ class ControlPanel(QtWidgets.QWidget):
         mon_layout.addWidget(self.mon_combo)
         layout.addLayout(mon_layout)
 
-        self.visible_check = QtWidgets.QCheckBox("Show active area (visual check)")
-        self.visible_check.stateChanged.connect(self.toggle_visibility)
-        layout.addWidget(self.visible_check)
+        self.adjust_check = QtWidgets.QCheckBox("Show && adjust position (drag && drop)")
+        self.adjust_check.stateChanged.connect(self.toggle_adjustment)
+        layout.addWidget(self.adjust_check)
 
         self.ontop_check = QtWidgets.QCheckBox("Keep Control Panel on top")
         self.ontop_check.stateChanged.connect(self.toggle_ontop)
@@ -225,7 +269,39 @@ class ControlPanel(QtWidgets.QWidget):
         btn_hide.clicked.connect(self.hide_to_tray)
         layout.addWidget(btn_hide)
 
+        # Кнопка Ko-fi (печенька) в правом верхнем углу окна
+        self.btn_coffee = QtWidgets.QPushButton(self)
+        self.btn_coffee.setToolTip("Support development on Ko-fi")
+        self.btn_coffee.setFixedSize(26, 26)
+        self.btn_coffee.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.btn_coffee.setStyleSheet("""
+            QPushButton {
+                background-color: transparent;
+                border: none;
+                padding: 0px;
+            }
+            QPushButton:hover {
+                background-color: rgba(255, 255, 255, 0.08);
+                border-radius: 4px;
+            }
+        """)
+        
+        logo_path = get_resource_path("cookielogo.png")
+        if os.path.exists(logo_path):
+            self.btn_coffee.setIcon(QtGui.QIcon(logo_path))
+            self.btn_coffee.setIconSize(QtCore.QSize(22, 22))
+            
+        self.btn_coffee.clicked.connect(lambda: QtGui.QDesktopServices.openUrl(QtCore.QUrl("https://ko-fi.com/pixelcraft404")))
+
         self.setLayout(layout)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, 'btn_coffee'):
+            x = self.width() - self.btn_coffee.width() - 10
+            y = 10
+            self.btn_coffee.move(x, y)
+            self.btn_coffee.raise_()
 
     def init_tray(self):
         self.tray_icon = QtWidgets.QSystemTrayIcon(self)
@@ -259,7 +335,7 @@ class ControlPanel(QtWidgets.QWidget):
                 h = int(rect.height() * ratio)
                 is_primary = (i == 0)
                 
-                label = f"Display {i} ({w}x{h})"
+                label = f"Display {i + 1} ({w}x{h})"
                 if is_primary:
                     label += " [Primary]"
                     
@@ -292,11 +368,18 @@ class ControlPanel(QtWidgets.QWidget):
             self.active_monitors.discard(idx)
             self.stop_worker_for_monitor(idx)
 
+    def on_worker_position_changed(self, idx, pos):
+        self.custom_positions[idx] = pos
+
     def start_worker_for_monitor(self, idx):
         if idx not in self.workers:
             worker = StealthWorker(idx)
             worker.set_boost(self.is_boosted)
-            worker.set_visibility(self.is_visible)
+            if idx in self.custom_positions:
+                worker.custom_pos = self.custom_positions[idx]
+                worker.move(self.custom_positions[idx])
+            worker.set_draggable(self.is_adjusting)
+            worker.positionChanged.connect(self.on_worker_position_changed)
             worker.render_timer.start(16)
             worker.show()
             worker.raise_()
@@ -310,10 +393,10 @@ class ControlPanel(QtWidgets.QWidget):
             worker.deleteLater()
             del self.workers[idx]
 
-    def toggle_visibility(self, state):
-        self.is_visible = (state == 2)
+    def toggle_adjustment(self, state):
+        self.is_adjusting = (state == 2)
         for worker in self.workers.values():
-            worker.set_visibility(self.is_visible)
+            worker.set_draggable(self.is_adjusting)
 
     def toggle_boost(self, state):
         self.is_boosted = (state == 2)
@@ -398,6 +481,23 @@ class ControlPanel(QtWidgets.QWidget):
 if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
+    
+    # Защита от повторного запуска (Single Instance Lock)
+    shared_mem = QtCore.QSharedMemory("DWMfix_Unique_SharedMemory_Lock")
+    if not shared_mem.create(1):
+        # Пытаемся найти уже запущенное окно и восстановить его
+        hwnd = win32gui.FindWindow(None, "DWM Aggressive Fixer")
+        if hwnd:
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            win32gui.SetForegroundWindow(hwnd)
+        win32api.MessageBox(
+            0,
+            "DWM Fixer is already running.",
+            "DWM Fixer",
+            win32con.MB_OK | win32con.MB_ICONWARNING | win32con.MB_SETFOREGROUND | win32con.MB_TOPMOST
+        )
+        sys.exit(0)
+    app.shared_mem = shared_mem
     
     panel = ControlPanel()
     
