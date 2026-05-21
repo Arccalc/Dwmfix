@@ -190,7 +190,10 @@ class ControlPanel(QtWidgets.QWidget):
         self.is_boosted = False
         self.is_active = True
         self.is_adjusting = False
+        
+        self.settings = QtCore.QSettings("PixelCraft", "DWMfix")
         self.custom_positions = {}
+        self.load_settings()
         
         self.init_ui()
         self.init_tray()
@@ -374,8 +377,20 @@ class ControlPanel(QtWidgets.QWidget):
             self.active_monitors.discard(idx)
             self.stop_worker_for_monitor(idx)
 
+    def load_settings(self):
+        for idx in range(10):  # Поддержка до 10 мониторов
+            x_val = self.settings.value(f"Positions/{idx}_x")
+            y_val = self.settings.value(f"Positions/{idx}_y")
+            if x_val is not None and y_val is not None:
+                try:
+                    self.custom_positions[idx] = QtCore.QPoint(int(x_val), int(y_val))
+                except (ValueError, TypeError):
+                    pass
+
     def on_worker_position_changed(self, idx, pos):
         self.custom_positions[idx] = pos
+        self.settings.setValue(f"Positions/{idx}_x", pos.x())
+        self.settings.setValue(f"Positions/{idx}_y", pos.y())
 
     def start_worker_for_monitor(self, idx):
         if idx not in self.workers:
