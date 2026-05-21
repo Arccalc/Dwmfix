@@ -4,6 +4,8 @@ import winreg
 import win32gui
 import win32api
 import win32con
+import webbrowser
+import tempfile
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 def get_resource_path(relative_path):
@@ -198,7 +200,7 @@ class ControlPanel(QtWidgets.QWidget):
 
     def init_ui(self):
         self.setWindowTitle("DWM Aggressive Fixer")
-        self.setFixedSize(320, 395)
+        self.setFixedSize(320, 435)
         
         self.setStyleSheet("""
             QWidget { background-color: #0c0c0e; color: #d1d1d1; font-family: 'Segoe UI'; }
@@ -268,6 +270,10 @@ class ControlPanel(QtWidgets.QWidget):
         btn_hide = QtWidgets.QPushButton("HIDE TO TRAY")
         btn_hide.clicked.connect(self.hide_to_tray)
         layout.addWidget(btn_hide)
+
+        btn_test = QtWidgets.QPushButton("TEST SMOOTHNESS")
+        btn_test.clicked.connect(self.toggle_test_window)
+        layout.addWidget(btn_test)
 
         # Кнопка Ko-fi (печенька) в правом верхнем углу окна
         self.btn_coffee = QtWidgets.QPushButton(self)
@@ -473,6 +479,324 @@ class ControlPanel(QtWidgets.QWidget):
         self.status_label.setText("STATUS: STOPPED")
         self.status_label.setStyleSheet("color: #ff4444; font-weight: bold;")
         self.btn_toggle.setText("START FIX")
+
+    def toggle_test_window(self):
+        html_content = """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>DWM Fixer - Judder & Smoothness Analyzer</title>
+    <style>
+        body {
+            margin: 0;
+            background-color: #0c0c0e;
+            color: #d1d1d1;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+        }
+        .container {
+            text-align: center;
+            width: 90%;
+            max-width: 900px;
+        }
+        h1 {
+            font-size: 26px;
+            color: #ffffff;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        p {
+            font-size: 14px;
+            color: #8a8a93;
+            margin-bottom: 20px;
+        }
+        .controls {
+            margin-bottom: 15px;
+            display: flex;
+            justify-content: center;
+            gap: 15px;
+        }
+        .btn {
+            background-color: #1a1a1f;
+            border: 1px solid #2a2a2f;
+            color: #d1d1d1;
+            padding: 8px 16px;
+            border-radius: 6px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        .btn:hover {
+            background-color: #24242b;
+        }
+        .btn.active {
+            background-color: #00c8ff;
+            color: #0c0c0e;
+            border-color: #00c8ff;
+        }
+        canvas {
+            background-color: #000000;
+            border: 1px solid #1a1a22;
+            border-radius: 8px;
+            width: 100%;
+            height: 400px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+        }
+        .kofi-container {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            z-index: 100;
+        }
+        @keyframes custom-wiggle {
+            0% { transform: rotate(0deg) scale(1); }
+            20% { transform: rotate(-10deg) scale(1.1); }
+            40% { transform: rotate(10deg) scale(1.1); }
+            60% { transform: rotate(-10deg) scale(1.1); }
+            80% { transform: rotate(10deg) scale(1.1); }
+            100% { transform: rotate(0deg) scale(1); }
+        }
+        .kofiimg, .kofi-img, img[src*="cup-border"] {
+            animation: none !important;
+        }
+        .kofi-button:hover .kofiimg, 
+        .kofi-button:hover .kofi-img,
+        .kofi-button:hover img[src*="cup-border"],
+        a[href*="ko-fi.com"]:hover img {
+            animation: custom-wiggle 0.6s ease-in-out !important;
+        }
+    </style>
+</head>
+<body>
+    <div class="kofi-container">
+        <script type='text/javascript' src='https://storage.ko-fi.com/cdn/widget/Widget_2.js'></script>
+        <script type='text/javascript'>
+            kofiwidget2.init('Support me on Ko-fi', '#13131a', 'M2C51ZTNGT');
+            kofiwidget2.draw();
+        </script>
+    </div>
+
+    <div class="container">
+        <h1>DWM Fixer - Judder & Smoothness Analyzer</h1>
+        <p>Drag this window to your second monitor. Toggling the fix will reveal massive differences in scrolling text clarity at 24 FPS.</p>
+        
+        <div class="controls">
+            <button class="btn" id="btn60" onclick="setFps(60)">60 FPS</button>
+            <button class="btn" id="btn30" onclick="setFps(30)">30 FPS</button>
+            <button class="btn active" id="btn24" onclick="setFps(24)">24 FPS (Movie Judder Test)</button>
+        </div>
+
+        <canvas id="testCanvas"></canvas>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('testCanvas');
+        const ctx = canvas.getContext('2d');
+        
+        let fpsLimit = 24;
+        let lastFrameTime = performance.now();
+        let lastTickTime = performance.now();
+        
+        // Scrolling offsets
+        let horizontalX = 0;
+        let verticalY = 0;
+        
+        // Speeds (pixels per second)
+        const horizontalSpeed = 350;
+        const verticalSpeed = 130;
+        
+        // Frame time history for the graph
+        const frameTimes = [];
+        const maxDataPoints = 120;
+
+        // Custom instruction text scrolling from bottom to top
+        const credits = [
+            "SMOOTHNESS TEST INSTRUCTIONS",
+            "----------------------------",
+            "1. Drag this window to the second monitor.",
+            "2. Toggle the fix in the Control Panel.",
+            "",
+            "When the fix is ACTIVE,",
+            "this text will glide smoothly.",
+            "When the fix is STOPPED,",
+            "the text will stutter and judder.",
+            "",
+            "The difference is most visible",
+            "when running at 24 FPS.",
+            "",
+            "DWM FIXER ACTIVE MODE TEST"
+        ];
+
+        function setFps(fps) {
+            fpsLimit = fps;
+            document.getElementById('btn60').classList.toggle('active', fps === 60);
+            document.getElementById('btn30').classList.toggle('active', fps === 30);
+            document.getElementById('btn24').classList.toggle('active', fps === 24);
+            frameTimes.length = 0; // Clear graph
+        }
+
+        function resize() {
+            const rect = canvas.getBoundingClientRect();
+            canvas.width = rect.width;
+            canvas.height = rect.height;
+            verticalY = canvas.height - 100;
+            horizontalX = canvas.width; // Start offscreen right
+        }
+        window.addEventListener('resize', resize);
+        resize();
+
+        function draw(time) {
+            requestAnimationFrame(draw);
+            
+            const delta = time - lastFrameTime;
+            const targetInterval = 1000 / fpsLimit;
+            
+            if (delta < targetInterval - 0.5) {
+                return; // Limit frame rate
+            }
+            
+            const now = performance.now();
+            const realDelta = now - lastTickTime;
+            lastTickTime = now;
+            
+            lastFrameTime = time - (delta % targetInterval);
+
+            if (realDelta < 200) {
+                frameTimes.push(realDelta);
+                if (frameTimes.length > maxDataPoints) {
+                    frameTimes.shift();
+                }
+            }
+
+            // Clear canvas to pure black for maximum text contrast
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            
+            // Draw horizontal ticker track background (pure black)
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(0, 20, canvas.width, 80);
+            
+            // Draw a subtle border separating sections
+            ctx.strokeStyle = '#1a1a22';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(0, 110);
+            ctx.lineTo(canvas.width, 110);
+            ctx.stroke();
+
+            // Calculate scrolling based on real time delta
+            const dt = realDelta / 1000;
+            
+            // 1. Horizontal ticker scroll (Big, Bold text)
+            const tickerText = "DWM FIXER JUDDER TEST • DWM FIXER JUDDER TEST • DWM FIXER JUDDER TEST";
+            ctx.font = 'bold 36px "Segoe UI", Arial';
+            const textWidth = ctx.measureText(tickerText).width;
+            
+            horizontalX -= horizontalSpeed * dt;
+            if (horizontalX < -textWidth) {
+                horizontalX = canvas.width;
+            }
+            
+            ctx.fillStyle = '#ffffff';
+            ctx.fillText(tickerText, horizontalX, 70);
+            
+            // 2. Vertical Credit Roll (Centered, medium text)
+            ctx.font = 'bold 18px "Segoe UI", Arial';
+            ctx.textAlign = 'center';
+            
+            const creditSpacing = 35;
+            const totalCreditsHeight = credits.length * creditSpacing;
+            
+            verticalY -= verticalSpeed * dt;
+            if (verticalY < -totalCreditsHeight) {
+                verticalY = canvas.height - 120;
+            }
+            
+            credits.forEach((line, index) => {
+                const yPos = verticalY + (index * creditSpacing);
+                if (yPos > 120 && yPos < canvas.height - 10) {
+                    // Highlight header lines
+                    if (index === 0 || index === 2 || index === 9) {
+                        ctx.fillStyle = '#00c8ff';
+                    } else {
+                        ctx.fillStyle = '#d1d1d1';
+                    }
+                    ctx.fillText(line, canvas.width / 2, yPos);
+                }
+            });
+            ctx.textAlign = 'left'; // Reset alignment
+
+            // Draw Frame Time Graph
+            drawGraph();
+        }
+
+        function drawGraph() {
+            const graphX = 20;
+            const graphY = canvas.height - 80;
+            const graphWidth = 200;
+            const graphHeight = 50;
+
+            // Draw background
+            ctx.fillStyle = 'rgba(10, 10, 14, 0.8)';
+            ctx.fillRect(graphX, graphY, graphWidth, graphHeight);
+            ctx.strokeStyle = '#2a2a2f';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(graphX, graphY, graphWidth, graphHeight);
+
+            if (frameTimes.length < 2) return;
+
+            // Plot line
+            ctx.beginPath();
+            ctx.strokeStyle = '#00c8ff';
+            ctx.lineWidth = 1.5;
+
+            const targetMs = 1000 / fpsLimit;
+            const minMs = targetMs - 15;
+            const maxMs = targetMs + 15;
+
+            for (let i = 0; i < frameTimes.length; i++) {
+                const ms = frameTimes[i];
+                const x = graphX + (i / (maxDataPoints - 1)) * graphWidth;
+                let normalizedY = (ms - minMs) / (maxMs - minMs);
+                normalizedY = Math.max(0, Math.min(1, normalizedY));
+                const y = graphY + graphHeight - (normalizedY * graphHeight);
+
+                if (i === 0) {
+                    ctx.moveTo(x, y);
+                } else {
+                    ctx.lineTo(x, y);
+                }
+            }
+            ctx.stroke();
+
+            // Label target frame time
+            ctx.fillStyle = '#8a8a93';
+            ctx.font = '9px monospace';
+            ctx.fillText(`Target: ${targetMs.toFixed(1)}ms`, graphX + 5, graphY + 12);
+            
+            // Show real time current FPS
+            const currentFps = 1000 / frameTimes[frameTimes.length - 1];
+            ctx.fillStyle = '#00ffcc';
+            ctx.fillText(`Current: ${currentFps.toFixed(0)} FPS`, graphX + 5, graphY + 23);
+        }
+
+        requestAnimationFrame(draw);
+    </script>
+</body>
+</html>
+"""
+        try:
+            temp_path = os.path.join(tempfile.gettempdir(), "dwmfix_smoothness_test.html")
+            with open(temp_path, "w", encoding="utf-8") as f:
+                f.write(html_content)
+            webbrowser.open(temp_path)
+        except Exception:
+            pass
 
     def closeEvent(self, event):
         event.ignore()
