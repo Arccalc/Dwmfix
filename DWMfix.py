@@ -609,10 +609,6 @@ class ControlPanel(QtWidgets.QWidget):
         // Speeds (pixels per second)
         const horizontalSpeed = 350;
         const verticalSpeed = 130;
-        
-        // Frame time history for the graph
-        const frameTimes = [];
-        const maxDataPoints = 120;
 
         // Custom instruction text scrolling from bottom to top
         const credits = [
@@ -637,7 +633,6 @@ class ControlPanel(QtWidgets.QWidget):
             document.getElementById('btn60').classList.toggle('active', fps === 60);
             document.getElementById('btn30').classList.toggle('active', fps === 30);
             document.getElementById('btn24').classList.toggle('active', fps === 24);
-            frameTimes.length = 0; // Clear graph
         }
 
         function resize() {
@@ -665,13 +660,6 @@ class ControlPanel(QtWidgets.QWidget):
             lastTickTime = now;
             
             lastFrameTime = time - (delta % targetInterval);
-
-            if (realDelta < 200) {
-                frameTimes.push(realDelta);
-                if (frameTimes.length > maxDataPoints) {
-                    frameTimes.shift();
-                }
-            }
 
             // Clear canvas to pure black for maximum text contrast
             ctx.fillStyle = '#000000';
@@ -730,59 +718,6 @@ class ControlPanel(QtWidgets.QWidget):
                 }
             });
             ctx.textAlign = 'left'; // Reset alignment
-
-            // Draw Frame Time Graph
-            drawGraph();
-        }
-
-        function drawGraph() {
-            const graphX = 20;
-            const graphY = canvas.height - 80;
-            const graphWidth = 200;
-            const graphHeight = 50;
-
-            // Draw background
-            ctx.fillStyle = 'rgba(10, 10, 14, 0.8)';
-            ctx.fillRect(graphX, graphY, graphWidth, graphHeight);
-            ctx.strokeStyle = '#2a2a2f';
-            ctx.lineWidth = 1;
-            ctx.strokeRect(graphX, graphY, graphWidth, graphHeight);
-
-            if (frameTimes.length < 2) return;
-
-            // Plot line
-            ctx.beginPath();
-            ctx.strokeStyle = '#00c8ff';
-            ctx.lineWidth = 1.5;
-
-            const targetMs = 1000 / fpsLimit;
-            const minMs = targetMs - 15;
-            const maxMs = targetMs + 15;
-
-            for (let i = 0; i < frameTimes.length; i++) {
-                const ms = frameTimes[i];
-                const x = graphX + (i / (maxDataPoints - 1)) * graphWidth;
-                let normalizedY = (ms - minMs) / (maxMs - minMs);
-                normalizedY = Math.max(0, Math.min(1, normalizedY));
-                const y = graphY + graphHeight - (normalizedY * graphHeight);
-
-                if (i === 0) {
-                    ctx.moveTo(x, y);
-                } else {
-                    ctx.lineTo(x, y);
-                }
-            }
-            ctx.stroke();
-
-            // Label target frame time
-            ctx.fillStyle = '#8a8a93';
-            ctx.font = '9px monospace';
-            ctx.fillText(`Target: ${targetMs.toFixed(1)}ms`, graphX + 5, graphY + 12);
-            
-            // Show real time current FPS
-            const currentFps = 1000 / frameTimes[frameTimes.length - 1];
-            ctx.fillStyle = '#00ffcc';
-            ctx.fillText(`Current: ${currentFps.toFixed(0)} FPS`, graphX + 5, graphY + 23);
         }
 
         requestAnimationFrame(draw);
