@@ -6,7 +6,7 @@ import win32api
 import win32con
 import webbrowser
 import tempfile
-from PyQt6 import QtCore, QtGui, QtWidgets
+from PyQt6 import QtCore, QtGui, QtWidgets, QtNetwork
 
 def get_resource_path(relative_path):
     """Возвращает абсолютный путь к ресурсу, учитывая упаковку PyInstaller."""
@@ -183,8 +183,12 @@ class StealthWorker(QtWidgets.QWidget):
             painter.fillRect(self.rect(), gradient)
 
 class ControlPanel(QtWidgets.QWidget):
-    def __init__(self):
+    def __init__(self, server=None):
         super().__init__()
+        self.server = server
+        if self.server:
+            self.server.newConnection.connect(self.handle_new_connection)
+            
         self.workers = {}  # {monitor_idx: StealthWorker}
         self.active_monitors = set()
         self.is_boosted = False
@@ -324,12 +328,33 @@ class ControlPanel(QtWidgets.QWidget):
         
         menu = QtWidgets.QMenu()
         menu.addAction("Restore Panel").triggered.connect(self.show_and_raise)
+        menu.addAction("Stealth Mode").triggered.connect(self.activate_stealth_mode)
         menu.addSeparator()
         menu.addAction("Exit Completely").triggered.connect(QtWidgets.QApplication.quit)
         
         self.tray_icon.setContextMenu(menu)
         self.tray_icon.activated.connect(lambda r: self.show_and_raise() if r == QtWidgets.QSystemTrayIcon.ActivationReason.Trigger else None)
         self.tray_icon.show()
+
+    def activate_stealth_mode(self):
+        self.tray_icon.hide()
+        self.hide()
+
+    def restore_from_stealth(self):
+        self.tray_icon.show()
+        self.show_and_raise()
+
+    def handle_new_connection(self):
+        socket = self.server.nextPendingConnection()
+        if socket:
+            socket.setParent(self)
+            socket.readyRead.connect(lambda s=socket: self.read_socket(s))
+
+    def read_socket(self, socket):
+        data = socket.readAll().data()
+        if data == b"restore":
+            self.restore_from_stealth()
+        socket.deleteLater()
 
     def hide_to_tray(self):
         self.hide()
@@ -775,24 +800,23 @@ if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     
-    # Защита от повторного запуска (Single Instance Lock)
-    shared_mem = QtCore.QSharedMemory("DWMfix_Unique_SharedMemory_Lock")
-    if not shared_mem.create(1):
-        # Пытаемся найти уже запущенное окно и восстановить его
-        hwnd = win32gui.FindWindow(None, "DWM Aggressive Fixer")
-        if hwnd:
-            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-            win32gui.SetForegroundWindow(hwnd)
-        win32api.MessageBox(
-            0,
-            "DWM Fixer is already running.",
-            "DWM Fixer",
-            win32con.MB_OK | win32con.MB_ICONWARNING | win32con.MB_SETFOREGROUND | win32con.MB_TOPMOST
-        )
-        sys.exit(0)
-    app.shared_mem = shared_mem
+    server_name = "DWMfix_IPC_Server"
     
-    panel = ControlPanel()
+    # Try to connect to existing local server to detect running instance
+    socket = QtNetwork.QLocalSocket()
+    socket.connectToServer(server_name)
+    if socket.waitForConnected(500):
+        # Already running! Send restore command and exit.
+        socket.write(b"restore")
+        socket.waitForBytesWritten(500)
+        sys.exit(0)
+        
+    # We are the first instance. Create local server
+    server = QtNetwork.QLocalServer()
+    server.removeServer(server_name)
+    server.listen(server_name)
+    
+    panel = ControlPanel(server)
     
     if "--startup" not in sys.argv:
         panel.show()
