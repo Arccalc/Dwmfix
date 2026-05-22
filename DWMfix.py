@@ -204,6 +204,8 @@ class ControlPanel(QtWidgets.QWidget):
     def init_ui(self):
         self.setWindowTitle("DWM Aggressive Fixer")
         self.setFixedSize(320, 435)
+        if getattr(self, 'is_ontop', False):
+            self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowType.WindowStaysOnTopHint)
         
         self.setStyleSheet("""
             QWidget { background-color: #0c0c0e; color: #d1d1d1; font-family: 'Segoe UI'; }
@@ -254,10 +256,12 @@ class ControlPanel(QtWidgets.QWidget):
         layout.addWidget(self.adjust_check)
 
         self.ontop_check = QtWidgets.QCheckBox("Keep Control Panel on top")
+        self.ontop_check.setChecked(getattr(self, 'is_ontop', False))
         self.ontop_check.stateChanged.connect(self.toggle_ontop)
         layout.addWidget(self.ontop_check)
 
         self.boost_check = QtWidgets.QCheckBox("Boost Mode (use if stutter persists)")
+        self.boost_check.setChecked(getattr(self, 'is_boosted', False))
         self.boost_check.stateChanged.connect(self.toggle_boost)
         layout.addWidget(self.boost_check)
         
@@ -378,6 +382,18 @@ class ControlPanel(QtWidgets.QWidget):
             self.stop_worker_for_monitor(idx)
 
     def load_settings(self):
+        # Load boost mode
+        val_boost = self.settings.value("is_boosted")
+        if val_boost is not None:
+            self.is_boosted = (val_boost == 'true' or val_boost is True)
+            
+        # Load stays on top mode
+        val_ontop = self.settings.value("is_ontop")
+        if val_ontop is not None:
+            self.is_ontop = (val_ontop == 'true' or val_ontop is True)
+        else:
+            self.is_ontop = False
+
         for idx in range(10):  # Поддержка до 10 мониторов
             x_val = self.settings.value(f"Positions/{idx}_x")
             y_val = self.settings.value(f"Positions/{idx}_y")
@@ -421,6 +437,7 @@ class ControlPanel(QtWidgets.QWidget):
 
     def toggle_boost(self, state):
         self.is_boosted = (state == 2)
+        self.settings.setValue("is_boosted", self.is_boosted)
         for worker in self.workers.values():
             worker.set_boost(self.is_boosted)
 
@@ -467,7 +484,9 @@ class ControlPanel(QtWidgets.QWidget):
         self.raise_()
 
     def toggle_ontop(self, state):
-        if state == 2:
+        self.is_ontop = (state == 2)
+        self.settings.setValue("is_ontop", self.is_ontop)
+        if self.is_ontop:
             self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowType.WindowStaysOnTopHint)
         else:
             self.setWindowFlags(self.windowFlags() & ~QtCore.Qt.WindowType.WindowStaysOnTopHint)
