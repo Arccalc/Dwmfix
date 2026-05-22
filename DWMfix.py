@@ -182,6 +182,86 @@ class StealthWorker(QtWidgets.QWidget):
             gradient.setColorAt(1, color2)
             painter.fillRect(self.rect(), gradient)
 
+class UpdateCheckThread(QtCore.QThread):
+    update_available = QtCore.pyqtSignal(str, str)  # (version, download_url)
+
+    def __init__(self, current_version):
+        super().__init__()
+        self.current_version = current_version
+
+    def run(self):
+        try:
+            import urllib.request
+            import json
+            
+            url = "https://api.github.com/repos/Arccalc/Dwmfix/releases/latest"
+            req = urllib.request.Request(url, headers={"User-Agent": "DWMfix-Updater"})
+            with urllib.request.urlopen(req, timeout=5) as response:
+                if response.status == 200:
+                    data = json.loads(response.read().decode('utf-8'))
+                    tag_name = data.get("tag_name", "")
+                    online_ver = tag_name.strip().lstrip("v")
+                    
+                    if self.is_newer(online_ver, self.current_version):
+                        assets = data.get("assets", [])
+                        download_url = None
+                        for asset in assets:
+                            if asset.get("name") == "DWMfix.zip":
+                                download_url = asset.get("browser_download_url")
+                                break
+                        if not download_url and assets:
+                            download_url = assets[0].get("browser_download_url")
+                            
+                        if download_url:
+                            self.update_available.emit(online_ver, download_url)
+        except Exception:
+            pass
+
+    def is_newer(self, online, current):
+        try:
+            o_parts = [int(p) for p in online.split(".")]
+            c_parts = [int(p) for p in current.split(".")]
+            max_len = max(len(o_parts), len(c_parts))
+            o_parts += [0] * (max_len - len(o_parts))
+            c_parts += [0] * (max_len - len(c_parts))
+            return o_parts > c_parts
+        except Exception:
+            return online > current
+
+class DownloadUpdateThread(QtCore.QThread):
+    progress = QtCore.pyqtSignal(int)
+    finished = QtCore.pyqtSignal(str)  # zip path
+    error = QtCore.pyqtSignal(str)
+
+    def __init__(self, download_url):
+        super().__init__()
+        self.download_url = download_url
+
+    def run(self):
+        try:
+            import urllib.request
+            req = urllib.request.Request(self.download_url, headers={"User-Agent": "DWMfix-Updater"})
+            with urllib.request.urlopen(req) as response:
+                total_size = int(response.info().get('Content-Length', 0))
+                bytes_so_far = 0
+                chunk_size = 1024 * 64
+                
+                temp_zip = os.path.join(tempfile.gettempdir(), "dwmfix_update.zip")
+                with open(temp_zip, 'wb') as f:
+                    while True:
+                        chunk = response.read(chunk_size)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        bytes_so_far += len(chunk)
+                        if total_size > 0:
+                            percent = int(bytes_so_far * 100 / total_size)
+                            self.progress.emit(percent)
+                
+                self.finished.emit(temp_zip)
+        except Exception as e:
+            self.error.emit(str(e))
+
 class ControlPanel(QtWidgets.QWidget):
     def __init__(self, server=None):
         super().__init__()
@@ -201,6 +281,12 @@ class ControlPanel(QtWidgets.QWidget):
         
         self.init_ui()
         self.init_tray()
+        
+        # Проверка обновлений на старте
+        self.version = "1.3"
+        self.update_thread = UpdateCheckThread(self.version)
+        self.update_thread.update_available.connect(self.on_update_available)
+        self.update_thread.start()
         
         # Запуск фикса при старте
         self.start_fix()
@@ -355,6 +441,73 @@ class ControlPanel(QtWidgets.QWidget):
         if data == b"restore":
             self.restore_from_stealth()
         socket.deleteLater()
+
+    def on_update_available(self, online_ver, download_url):
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Update Available",
+            f"A new version of DWM Fixer ({online_ver}) is available.\nWould you like to download and install it now?",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No
+        )
+        if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+            if not getattr(sys, 'frozen', False):
+                QtWidgets.QMessageBox.information(self, "Update", "Auto-update is only supported for the compiled executable version.")
+                return
+            self.start_update_download(download_url)
+
+    def start_update_download(self, url):
+        self.progress_dialog = QtWidgets.QProgressDialog("Downloading update...", "Cancel", 0, 100, self)
+        self.progress_dialog.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        self.progress_dialog.setAutoClose(True)
+        self.progress_dialog.show()
+
+        self.download_thread = DownloadUpdateThread(url)
+        self.download_thread.progress.connect(self.progress_dialog.setValue)
+        self.download_thread.finished.connect(self.install_update)
+        self.download_thread.error.connect(self.on_update_error)
+        self.download_thread.start()
+
+    def on_update_error(self, err_msg):
+        if hasattr(self, 'progress_dialog'):
+            self.progress_dialog.close()
+        QtWidgets.QMessageBox.critical(self, "Update Error", f"Failed to download update:\n{err_msg}")
+
+    def install_update(self, zip_path):
+        if hasattr(self, 'progress_dialog'):
+            self.progress_dialog.close()
+            
+        app_dir = os.path.dirname(sys.executable)
+        temp_dir = tempfile.gettempdir()
+        extract_dir = os.path.join(temp_dir, "dwmfix_extract")
+        bat_path = os.path.join(temp_dir, "dwmfix_updater.bat")
+        
+        bat_content = f"""@echo off
+timeout /t 2 /nobreak > nul
+powershell -Command "Expand-Archive -Path '{zip_path}' -DestinationPath '{extract_dir}' -Force"
+
+if exist "{extract_dir}\\DWMfix" (
+    xcopy /y /e /q "{extract_dir}\\DWMfix\\*" "{app_dir}"
+) else (
+    xcopy /y /e /q "{extract_dir}\\*" "{app_dir}"
+)
+
+start "" "{os.path.join(app_dir, "DWMfix.exe")}"
+del /f /q "{zip_path}"
+rmdir /s /q "{extract_dir}"
+(goto) 2>nul & del "%~f0"
+"""
+        try:
+            with open(bat_path, "w", encoding="utf-8") as f:
+                f.write(bat_content)
+                
+            import subprocess
+            subprocess.Popen(
+                [bat_path],
+                creationflags=subprocess.CREATE_NEW_CONSOLE | subprocess.DETACHED_PROCESS if sys.platform == "win32" else 0
+            )
+            QtWidgets.QApplication.quit()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Update Error", f"Failed to start updater:\n{str(e)}")
 
     def hide_to_tray(self):
         self.hide()
