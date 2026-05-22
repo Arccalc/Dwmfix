@@ -283,7 +283,7 @@ class ControlPanel(QtWidgets.QWidget):
         self.init_tray()
         
         # Проверка обновлений на старте
-        self.version = "1.3"
+        self.version = "1.2.6"
         self.update_thread = UpdateCheckThread(self.version)
         self.update_thread.update_available.connect(self.on_update_available)
         self.update_thread.start()
