@@ -183,7 +183,7 @@ class StealthWorker(QtWidgets.QWidget):
             painter.fillRect(self.rect(), gradient)
 
 class UpdateCheckThread(QtCore.QThread):
-    update_available = QtCore.pyqtSignal(str, str)  # (version, download_url)
+    update_available = QtCore.pyqtSignal(str, str, str)  # (version, download_url, checksum_url)
 
     def __init__(self, current_version):
         super().__init__()
@@ -193,7 +193,7 @@ class UpdateCheckThread(QtCore.QThread):
         try:
             import urllib.request
             import json
-            
+
             url = "https://api.github.com/repos/Arccalc/Dwmfix/releases/latest"
             req = urllib.request.Request(url, headers={"User-Agent": "DWMfix-Updater"})
             with urllib.request.urlopen(req, timeout=5) as response:
@@ -201,19 +201,23 @@ class UpdateCheckThread(QtCore.QThread):
                     data = json.loads(response.read().decode('utf-8'))
                     tag_name = data.get("tag_name", "")
                     online_ver = tag_name.strip().lstrip("v")
-                    
+
                     if self.is_newer(online_ver, self.current_version):
                         assets = data.get("assets", [])
                         download_url = None
+                        checksum_url = ""
                         for asset in assets:
                             if asset.get("name") == "DWMfix.zip":
                                 download_url = asset.get("browser_download_url")
-                                break
-                        if not download_url and assets:
-                            download_url = assets[0].get("browser_download_url")
-                            
+                            elif asset.get("name") == "DWMfix.zip.sha256":
+                                checksum_url = asset.get("browser_download_url") or ""
+
+                        # No fallback: if the expected asset isn't present, there is no
+                        # valid update to offer. Never trust an arbitrary first asset.
                         if download_url:
-                            self.update_available.emit(online_ver, download_url)
+                            self.update_available.emit(online_ver, download_url, checksum_url)
+                        else:
+                            print("Update check: release has no 'DWMfix.zip' asset; skipping update.")
         except Exception:
             pass
 
@@ -233,9 +237,10 @@ class DownloadUpdateThread(QtCore.QThread):
     finished = QtCore.pyqtSignal(str)  # zip path
     error = QtCore.pyqtSignal(str)
 
-    def __init__(self, download_url):
+    def __init__(self, download_url, checksum_url=""):
         super().__init__()
         self.download_url = download_url
+        self.checksum_url = checksum_url
 
     def run(self):
         try:
@@ -245,7 +250,7 @@ class DownloadUpdateThread(QtCore.QThread):
                 total_size = int(response.info().get('Content-Length', 0))
                 bytes_so_far = 0
                 chunk_size = 1024 * 64
-                
+
                 temp_zip = os.path.join(tempfile.gettempdir(), "dwmfix_update.zip")
                 with open(temp_zip, 'wb') as f:
                     while True:
@@ -257,7 +262,29 @@ class DownloadUpdateThread(QtCore.QThread):
                         if total_size > 0:
                             percent = int(bytes_so_far * 100 / total_size)
                             self.progress.emit(percent)
-                
+
+                if self.checksum_url:
+                    import hashlib
+                    checksum_req = urllib.request.Request(self.checksum_url, headers={"User-Agent": "DWMfix-Updater"})
+                    with urllib.request.urlopen(checksum_req, timeout=10) as checksum_response:
+                        checksum_text = checksum_response.read().decode('utf-8', errors='ignore')
+                    # Accepts a bare hex digest or standard "sha256sum" output
+                    # ("<hex>  filename"); only the first whitespace-separated
+                    # token is taken as the expected digest.
+                    expected_hash = checksum_text.strip().split()[0].lower() if checksum_text.strip() else ""
+
+                    actual_hash = hashlib.sha256()
+                    with open(temp_zip, 'rb') as f:
+                        for chunk in iter(lambda: f.read(chunk_size), b""):
+                            actual_hash.update(chunk)
+                    actual_hash = actual_hash.hexdigest().lower()
+
+                    if not expected_hash or expected_hash != actual_hash:
+                        self.error.emit("Checksum verification failed — update aborted for safety.")
+                        return
+                else:
+                    print("Update download: no checksum asset published for this release; proceeding without verification.")
+
                 self.finished.emit(temp_zip)
         except Exception as e:
             self.error.emit(str(e))
@@ -442,7 +469,7 @@ class ControlPanel(QtWidgets.QWidget):
             self.restore_from_stealth()
         socket.deleteLater()
 
-    def on_update_available(self, online_ver, download_url):
+    def on_update_available(self, online_ver, download_url, checksum_url=""):
         reply = QtWidgets.QMessageBox.question(
             self,
             "Update Available",
@@ -453,15 +480,15 @@ class ControlPanel(QtWidgets.QWidget):
             if not getattr(sys, 'frozen', False):
                 QtWidgets.QMessageBox.information(self, "Update", "Auto-update is only supported for the compiled executable version.")
                 return
-            self.start_update_download(download_url)
+            self.start_update_download(download_url, checksum_url)
 
-    def start_update_download(self, url):
+    def start_update_download(self, url, checksum_url=""):
         self.progress_dialog = QtWidgets.QProgressDialog("Downloading update...", "Cancel", 0, 100, self)
         self.progress_dialog.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
         self.progress_dialog.setAutoClose(True)
         self.progress_dialog.show()
 
-        self.download_thread = DownloadUpdateThread(url)
+        self.download_thread = DownloadUpdateThread(url, checksum_url)
         self.download_thread.progress.connect(self.progress_dialog.setValue)
         self.download_thread.finished.connect(self.install_update)
         self.download_thread.error.connect(self.on_update_error)
