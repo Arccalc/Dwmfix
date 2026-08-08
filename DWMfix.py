@@ -6,7 +6,30 @@ import win32api
 import win32con
 import webbrowser
 import tempfile
+import logging
+import logging.handlers
 from PyQt6 import QtCore, QtGui, QtWidgets, QtNetwork
+
+# --- Logging setup ---------------------------------------------------------
+# Previously, broad exception handlers throughout this file silently
+# discarded errors, making user-reported bugs impossible to diagnose.
+# All such handlers now log here so failures leave a trace.
+LOG_DIR = os.path.join(os.getenv("LOCALAPPDATA") or tempfile.gettempdir(), "DWMfix")
+try:
+    os.makedirs(LOG_DIR, exist_ok=True)
+except Exception:
+    LOG_DIR = tempfile.gettempdir()
+
+LOG_PATH = os.path.join(LOG_DIR, "dwmfix.log")
+
+logger = logging.getLogger("dwmfix")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _log_handler = logging.handlers.RotatingFileHandler(
+        LOG_PATH, maxBytes=1 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+    _log_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(_log_handler)
 
 def get_resource_path(relative_path):
     """Возвращает абсолютный путь к ресурсу, учитывая упаковку PyInstaller."""
@@ -145,7 +168,8 @@ class StealthWorker(QtWidgets.QWidget):
                 self.move(x, y)
             else:
                 self.move(0, 0)
-        except:
+        except Exception as e:
+            logger.warning("move_to_monitor fallback: %s", e)
             self.move(0, 0)
 
     def mousePressEvent(self, event):
@@ -214,8 +238,8 @@ class UpdateCheckThread(QtCore.QThread):
                             
                         if download_url:
                             self.update_available.emit(online_ver, download_url)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("UpdateCheckThread.run failed: %s", e)
 
     def is_newer(self, online, current):
         try:
@@ -225,7 +249,8 @@ class UpdateCheckThread(QtCore.QThread):
             o_parts += [0] * (max_len - len(o_parts))
             c_parts += [0] * (max_len - len(c_parts))
             return o_parts > c_parts
-        except Exception:
+        except Exception as e:
+            logger.warning("is_newer version comparison failed, falling back to string compare: %s", e)
             return online > current
 
 class DownloadUpdateThread(QtCore.QThread):
@@ -260,6 +285,7 @@ class DownloadUpdateThread(QtCore.QThread):
                 
                 self.finished.emit(temp_zip)
         except Exception as e:
+            logger.warning("DownloadUpdateThread.run failed: %s", e)
             self.error.emit(str(e))
 
 class ControlPanel(QtWidgets.QWidget):
@@ -415,12 +441,23 @@ class ControlPanel(QtWidgets.QWidget):
         menu = QtWidgets.QMenu()
         menu.addAction("Restore Panel").triggered.connect(self.show_and_raise)
         menu.addAction("Stealth Mode").triggered.connect(self.activate_stealth_mode)
+        menu.addAction("View Log").triggered.connect(self.view_log)
         menu.addSeparator()
         menu.addAction("Exit Completely").triggered.connect(QtWidgets.QApplication.quit)
-        
+
         self.tray_icon.setContextMenu(menu)
         self.tray_icon.activated.connect(lambda r: self.show_and_raise() if r == QtWidgets.QSystemTrayIcon.ActivationReason.Trigger else None)
         self.tray_icon.show()
+
+    def view_log(self):
+        if not os.path.exists(LOG_PATH):
+            QtWidgets.QMessageBox.information(self, "View Log", "No log file found yet.")
+            return
+        try:
+            os.startfile(LOG_PATH)
+        except Exception as e:
+            logger.warning("view_log failed to open log file: %s", e)
+            QtWidgets.QMessageBox.warning(self, "View Log", f"Could not open log file:\n{e}")
 
     def activate_stealth_mode(self):
         self.tray_icon.hide()
@@ -507,6 +544,7 @@ rmdir /s /q "{extract_dir}"
             )
             QtWidgets.QApplication.quit()
         except Exception as e:
+            logger.exception("install_update failed to start updater")
             QtWidgets.QMessageBox.critical(self, "Update Error", f"Failed to start updater:\n{str(e)}")
 
     def hide_to_tray(self):
@@ -542,7 +580,8 @@ rmdir /s /q "{extract_dir}"
                     item.setCheckState(QtCore.Qt.CheckState.Unchecked)
                     
                 model.appendRow(item)
-        except Exception:
+        except Exception as e:
+            logger.warning("update_monitor_list failed, falling back to default display: %s", e)
             model = self.mon_combo.model()
             item = QtGui.QStandardItem("Default Display")
             item.setCheckable(True)
@@ -645,16 +684,16 @@ rmdir /s /q "{extract_dir}"
                     approve_key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run", 0, winreg.KEY_ALL_ACCESS)
                     winreg.DeleteValue(approve_key, "DWMfix")
                     winreg.CloseKey(approve_key)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("toggle_startup: failed to clear StartupApproved entry: %s", e)
             else:
                 try:
                     winreg.DeleteValue(key, "DWMfix")
                 except FileNotFoundError:
                     pass
             winreg.CloseKey(key)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("toggle_startup failed: %s", e)
 
     def show_and_raise(self):
         self.showNormal()
@@ -942,8 +981,8 @@ rmdir /s /q "{extract_dir}"
             with open(temp_path, "w", encoding="utf-8") as f:
                 f.write(html_content)
             webbrowser.open(temp_path)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("toggle_test_window failed to open test page: %s", e)
 
     def closeEvent(self, event):
         event.ignore()
