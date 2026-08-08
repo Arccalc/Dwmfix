@@ -274,7 +274,15 @@ class ControlPanel(QtWidgets.QWidget):
         self.is_boosted = False
         self.is_active = True
         self.is_adjusting = False
-        
+
+        # Tracks currently-running background QThreads (update check / download)
+        # so they can be waited on before the app exits, avoiding a
+        # "QThread: Destroyed while thread is still running" crash.
+        self._active_threads = []
+        app_instance = QtWidgets.QApplication.instance()
+        if app_instance is not None:
+            app_instance.aboutToQuit.connect(self._cleanup_threads_on_quit)
+
         self.settings = QtCore.QSettings("PixelCraft", "DWMfix")
         self.custom_positions = {}
         self.load_settings()
@@ -286,10 +294,44 @@ class ControlPanel(QtWidgets.QWidget):
         self.version = "1.2.6"
         self.update_thread = UpdateCheckThread(self.version)
         self.update_thread.update_available.connect(self.on_update_available)
+        self._track_thread(self.update_thread)
         self.update_thread.start()
         
         # Запуск фикса при старте
         self.start_fix()
+
+    def _track_thread(self, thread, finished_signal=None):
+        """Register a QThread so it gets waited on / cleaned up properly.
+
+        `finished_signal` lets callers pass the real QThread.finished signal
+        for subclasses (like DownloadUpdateThread) that define their own
+        `finished` signal with a different signature, which shadows the
+        built-in one on the instance's `.finished` attribute.
+        """
+        if finished_signal is None:
+            finished_signal = thread.finished
+
+        def _on_finished(t=thread):
+            if t in self._active_threads:
+                self._active_threads.remove(t)
+
+        self._active_threads.append(thread)
+        finished_signal.connect(_on_finished)
+        finished_signal.connect(thread.deleteLater)
+
+    def _cleanup_threads_on_quit(self):
+        """Best-effort teardown of still-running worker threads on app exit.
+
+        This is a bounded wait, not a guaranteed clean cancel: the network
+        calls in UpdateCheckThread/DownloadUpdateThread use
+        urllib.request.urlopen(), which does not respond to QThread.quit(),
+        so a stuck request can still take up to the 2s timeout before we
+        move on instead of hanging the app shutdown indefinitely.
+        """
+        for thread in list(self._active_threads):
+            if thread.isRunning():
+                thread.quit()
+                thread.wait(2000)
 
     def init_ui(self):
         self.setWindowTitle("DWM Aggressive Fixer")
@@ -465,6 +507,11 @@ class ControlPanel(QtWidgets.QWidget):
         self.download_thread.progress.connect(self.progress_dialog.setValue)
         self.download_thread.finished.connect(self.install_update)
         self.download_thread.error.connect(self.on_update_error)
+        # DownloadUpdateThread declares its own `finished = pyqtSignal(str)`,
+        # which shadows QThread's built-in no-arg `finished` signal on this
+        # instance. Grab the real QThread lifecycle signal explicitly so
+        # cleanup fires on thread exit, not on download completion.
+        self._track_thread(self.download_thread, QtCore.QThread.finished.__get__(self.download_thread))
         self.download_thread.start()
 
     def on_update_error(self, err_msg):
