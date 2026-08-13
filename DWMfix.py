@@ -75,6 +75,32 @@ class StealthWorker(QtWidgets.QWidget):
     """Графически активное окно для принудительной стимуляции DWM на конкретном мониторе."""
     positionChanged = QtCore.pyqtSignal(int, QtCore.QPoint)
 
+    RENDER_INTERVAL_MS = 16  # target render timer interval, in milliseconds
+
+    # Relative hue offsets (degrees) for the 13 stops of the boosted conical
+    # gradient, precomputed once instead of recomputed every frame.
+    _CONIC_HUE_OFFSETS = tuple(i * 30 for i in range(13))
+
+    # Discrete hue palette used to look up gradient colors each frame instead
+    # of calling QColor.fromHsv(...) fresh every paint. 90 steps -> 4 degrees
+    # per step, fine enough that the color cycling still looks continuous.
+    _PALETTE_SIZE = 90
+    _hue_palette = None  # built lazily on first use, shared by all instances
+
+    @classmethod
+    def _get_hue_palette(cls):
+        if cls._hue_palette is None:
+            cls._hue_palette = [
+                QtGui.QColor.fromHsv(int(i * 360 / cls._PALETTE_SIZE), 200, 255)
+                for i in range(cls._PALETTE_SIZE)
+            ]
+        return cls._hue_palette
+
+    @classmethod
+    def _palette_color(cls, hue):
+        palette = cls._get_hue_palette()
+        return palette[(int(hue) * cls._PALETTE_SIZE // 360) % cls._PALETTE_SIZE]
+
     def __init__(self, target_monitor_idx):
         super().__init__()
         self.setWindowFlags(
@@ -171,13 +197,13 @@ class StealthWorker(QtWidgets.QWidget):
         if self.is_boosted:
             gradient = QtGui.QConicalGradient(QtCore.QPointF(self.rect().center()), float(self.offset))
             for i in range(13):
-                hue = (self.offset + (i * 30)) % 360
-                gradient.setColorAt(i / 12, QtGui.QColor.fromHsv(hue, 200, 255))
+                hue = (self.offset + self._CONIC_HUE_OFFSETS[i]) % 360
+                gradient.setColorAt(i / 12, self._palette_color(hue))
             painter.fillRect(self.rect(), gradient)
         else:
             gradient = QtGui.QLinearGradient(0, 0, self.width(), self.height())
-            color1 = QtGui.QColor.fromHsv(self.offset, 200, 255)
-            color2 = QtGui.QColor.fromHsv((self.offset + 180) % 360, 200, 255)
+            color1 = self._palette_color(self.offset)
+            color2 = self._palette_color((self.offset + 180) % 360)
             gradient.setColorAt(0, color1)
             gradient.setColorAt(1, color2)
             painter.fillRect(self.rect(), gradient)
@@ -595,7 +621,7 @@ rmdir /s /q "{extract_dir}"
                 worker.move(self.custom_positions[idx])
             worker.set_draggable(self.is_adjusting)
             worker.positionChanged.connect(self.on_worker_position_changed)
-            worker.render_timer.start(16)
+            worker.render_timer.start(StealthWorker.RENDER_INTERVAL_MS)
             worker.show()
             worker.raise_()
             self.workers[idx] = worker
