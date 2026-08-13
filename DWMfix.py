@@ -246,8 +246,8 @@ class DownloadUpdateThread(QtCore.QThread):
                 bytes_so_far = 0
                 chunk_size = 1024 * 64
                 
-                temp_zip = os.path.join(tempfile.gettempdir(), "dwmfix_update.zip")
-                with open(temp_zip, 'wb') as f:
+                fd, temp_zip = tempfile.mkstemp(suffix=".zip", prefix="dwmfix_update_")
+                with os.fdopen(fd, 'wb') as f:
                     while True:
                         chunk = response.read(chunk_size)
                         if not chunk:
@@ -477,10 +477,9 @@ class ControlPanel(QtWidgets.QWidget):
             self.progress_dialog.close()
             
         app_dir = os.path.dirname(sys.executable)
-        temp_dir = tempfile.gettempdir()
-        extract_dir = os.path.join(temp_dir, "dwmfix_extract")
-        bat_path = os.path.join(temp_dir, "dwmfix_updater.bat")
-        
+        extract_dir = tempfile.mkdtemp(prefix="dwmfix_extract_")
+        bat_fd, bat_path = tempfile.mkstemp(suffix=".bat", prefix="dwmfix_updater_")
+
         bat_content = f"""@echo off
 timeout /t 2 /nobreak > nul
 powershell -Command "Expand-Archive -Path '{zip_path}' -DestinationPath '{extract_dir}' -Force"
@@ -497,9 +496,9 @@ rmdir /s /q "{extract_dir}"
 (goto) 2>nul & del "%~f0"
 """
         try:
-            with open(bat_path, "w", encoding="utf-8") as f:
+            with os.fdopen(bat_fd, "w", encoding="utf-8") as f:
                 f.write(bat_content)
-                
+
             import subprocess
             subprocess.Popen(
                 [bat_path],
@@ -938,8 +937,8 @@ rmdir /s /q "{extract_dir}"
 </html>
 """
         try:
-            temp_path = os.path.join(tempfile.gettempdir(), "dwmfix_smoothness_test.html")
-            with open(temp_path, "w", encoding="utf-8") as f:
+            fd, temp_path = tempfile.mkstemp(suffix=".html", prefix="dwmfix_smoothness_test_")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(html_content)
             webbrowser.open(temp_path)
         except Exception:
