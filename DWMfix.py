@@ -1,5 +1,6 @@
 import sys
 import os
+import json
 import winreg
 import win32gui
 import win32api
@@ -15,6 +16,98 @@ def get_resource_path(relative_path):
     except Exception:
         base_path = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_path, relative_path)
+
+
+def screen_fingerprint(screen):
+    """Stable-ish identity for a monitor across sleep/reconnect.
+
+    Index and sometimes \\\\.\\DISPLAYn can change when a panel powers off/on.
+    Prefer serial/model/name + size; fall back to whatever Qt exposes.
+    """
+    g = screen.geometry()
+    return {
+        "name": (screen.name() or "").strip(),
+        "manufacturer": (screen.manufacturer() or "").strip(),
+        "model": (screen.model() or "").strip(),
+        "serial": (screen.serialNumber() or "").strip(),
+        "w": int(g.width()),
+        "h": int(g.height()),
+    }
+
+
+def fingerprint_key(fp):
+    if not fp:
+        return ""
+    if fp.get("serial"):
+        return f"serial:{fp['serial']}"
+    if fp.get("model"):
+        return f"model:{fp['model']}:{fp.get('w')}x{fp.get('h')}"
+    if fp.get("name"):
+        return f"name:{fp['name']}:{fp.get('w')}x{fp.get('h')}"
+    return f"size:{fp.get('w')}x{fp.get('h')}"
+
+
+def score_screen_match(fp, screen):
+    """Higher score = better match to stored preferred monitor."""
+    if not fp:
+        return 0
+    other = screen_fingerprint(screen)
+    score = 0
+    if fp.get("serial") and other["serial"] and fp["serial"] == other["serial"]:
+        score += 100
+    if fp.get("model") and other["model"] and fp["model"] == other["model"]:
+        score += 40
+    if fp.get("manufacturer") and other["manufacturer"] and fp["manufacturer"] == other["manufacturer"]:
+        score += 15
+    if fp.get("name") and other["name"] and fp["name"] == other["name"]:
+        score += 25
+    if fp.get("w") == other["w"] and fp.get("h") == other["h"]:
+        score += 10
+    return score
+
+
+def resolve_screen(preferred_fp, preferred_idx):
+    """Find the preferred screen without blindly clamping index to primary."""
+    screens = list(QtGui.QGuiApplication.screens())
+    if not screens:
+        return None, -1
+
+    if preferred_fp:
+        best_i = -1
+        best_score = 0
+        for i, screen in enumerate(screens):
+            s = score_screen_match(preferred_fp, screen)
+            if s > best_score:
+                best_score = s
+                best_i = i
+        # Require a meaningful match (not only resolution coincidence alone)
+        if best_i >= 0 and best_score >= 25:
+            return screens[best_i], best_i
+
+    if 0 <= preferred_idx < len(screens):
+        return screens[preferred_idx], preferred_idx
+
+    # Preferred offline: prefer a non-primary screen if any remain
+    primary = QtGui.QGuiApplication.primaryScreen()
+    for i, screen in enumerate(screens):
+        if primary is None or screen is not primary:
+            return screen, i
+
+    return screens[0], 0
+
+
+def screen_label(screen, index):
+    fp = screen_fingerprint(screen)
+    pretty = fp["model"] or fp["name"] or f"Display {index + 1}"
+    if pretty.startswith("\\\\.\\"):
+        pretty = f"Display {index + 1}"
+    rect = screen.geometry()
+    ratio = screen.devicePixelRatio()
+    w = int(rect.width() * ratio)
+    h = int(rect.height() * ratio)
+    primary = QtGui.QGuiApplication.primaryScreen()
+    suffix = " [Primary]" if primary is not None and screen is primary else ""
+    return f"{pretty} ({w}x{h}){suffix}"
 
 class CheckableComboBox(QtWidgets.QComboBox):
     """Выпадающий список с чекбоксами для выбора нескольких мониторов."""
@@ -73,9 +166,10 @@ class CheckableComboBox(QtWidgets.QComboBox):
 
 class StealthWorker(QtWidgets.QWidget):
     """Графически активное окно для принудительной стимуляции DWM на конкретном мониторе."""
-    positionChanged = QtCore.pyqtSignal(int, QtCore.QPoint)
+    # idx, pos, fingerprint_key — key stabilizes identity across display reconnects
+    positionChanged = QtCore.pyqtSignal(int, QtCore.QPoint, str)
 
-    def __init__(self, target_monitor_idx):
+    def __init__(self, target_monitor_idx, target_monitor_fp=None):
         super().__init__()
         self.setWindowFlags(
             QtCore.Qt.WindowType.FramelessWindowHint |
@@ -85,24 +179,32 @@ class StealthWorker(QtWidgets.QWidget):
             QtCore.Qt.WindowType.WindowDoesNotAcceptFocus
         )
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setWindowOpacity(0.01) # 1% видимости для DWM слоя (по умолчанию)
-        
+        self.setWindowOpacity(0.01)  # 1% видимости для DWM слоя (по умолчанию)
+
         self.base_width = 200
         self.base_height = 10
         self.boost_size = 400
         self.is_boosted = False
         self.target_monitor_idx = target_monitor_idx
-        
+        self.target_monitor_fp = target_monitor_fp
+        if self.target_monitor_fp is None:
+            screens = QtGui.QGuiApplication.screens()
+            if 0 <= target_monitor_idx < len(screens):
+                self.target_monitor_fp = screen_fingerprint(screens[target_monitor_idx])
+
         self.custom_pos = None
         self.draggable = False
-        
+
         self.setFixedSize(self.base_width, self.base_height)
-        
+
         self.offset = 0
         self.render_timer = QtCore.QTimer(self)
         self.render_timer.timeout.connect(self.repaint)
-        
+
         self.move_to_monitor()
+
+    def fp_key(self):
+        return fingerprint_key(self.target_monitor_fp)
 
     def update_opacity(self):
         if self.draggable:
@@ -132,20 +234,34 @@ class StealthWorker(QtWidgets.QWidget):
         self.move_to_monitor()
 
     def move_to_monitor(self):
-        if self.custom_pos is not None:
-            self.move(self.custom_pos)
-            return
-
         try:
-            screens = QtGui.QGuiApplication.screens()
-            if self.target_monitor_idx < len(screens):
-                rect = screens[self.target_monitor_idx].geometry()
-                x = rect.x() + rect.width() // 2 - self.width() // 2
-                y = rect.y() + rect.height() // 2 - self.height() // 2
-                self.move(x, y)
-            else:
+            screen, idx = resolve_screen(self.target_monitor_fp, self.target_monitor_idx)
+            if screen is None:
                 self.move(0, 0)
-        except:
+                return
+
+            # Keep index in sync when display order changes after reconnect
+            if self.target_monitor_fp and score_screen_match(self.target_monitor_fp, screen) >= 25:
+                self.target_monitor_idx = idx
+                # Refresh fingerprint fields in case name/size updated
+                self.target_monitor_fp = screen_fingerprint(screen)
+
+            rect = screen.geometry()
+            # Keep custom drag position only if it still lands on the target screen
+            if self.custom_pos is not None and rect.contains(self.custom_pos):
+                if self.x() != self.custom_pos.x() or self.y() != self.custom_pos.y():
+                    self.move(self.custom_pos)
+                return
+
+            if self.custom_pos is not None and not rect.contains(self.custom_pos):
+                # Topology shifted — drop stale absolute coords
+                self.custom_pos = None
+
+            x = rect.x() + rect.width() // 2 - self.width() // 2
+            y = rect.y() + rect.height() // 2 - self.height() // 2
+            if self.x() != x or self.y() != y:
+                self.move(x, y)
+        except Exception:
             self.move(0, 0)
 
     def mousePressEvent(self, event):
@@ -158,7 +274,7 @@ class StealthWorker(QtWidgets.QWidget):
             new_pos = event.globalPosition().toPoint() - self.drag_pos
             self.move(new_pos)
             self.custom_pos = new_pos
-            self.positionChanged.emit(self.target_monitor_idx, new_pos)
+            self.positionChanged.emit(self.target_monitor_idx, new_pos, self.fp_key())
             event.accept()
 
     def paintEvent(self, event):
@@ -262,32 +378,138 @@ class DownloadUpdateThread(QtCore.QThread):
         except Exception as e:
             self.error.emit(str(e))
 
+class KofiButton(QtWidgets.QPushButton):
+    """Печенька на месте прежней кнопки 26×26, подпись слева от неё."""
+
+    _TEXT = "News & Support"
+    _SLOT = 22
+    _GAP = 5
+    _RIGHT = 2
+    _HEIGHT = 26
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setToolTip("Ko-fi: news, updates and support")
+        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.setAutoFillBackground(False)
+        self.setStyleSheet(
+            "QPushButton, QPushButton:hover {"
+            "background-color: transparent;"
+            "border: none;"
+            "padding: 0px;"
+            "margin: 0px;"
+            "}"
+        )
+        self._font = QtGui.QFont("Segoe UI")
+        self._font.setPixelSize(11)
+        self._font.setWeight(QtGui.QFont.Weight.Normal)
+        self.setFont(self._font)
+
+        logo_path = get_resource_path("cookielogo.png")
+        self._cookie = QtGui.QPixmap()
+        if os.path.exists(logo_path):
+            self._cookie = QtGui.QPixmap(logo_path).scaled(
+                self._SLOT,
+                self._SLOT,
+                QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                QtCore.Qt.TransformationMode.SmoothTransformation,
+            )
+        self._opaque = self._opaque_box(self._cookie)
+        self._ink = QtGui.QFontMetrics(self._font).tightBoundingRect(self._TEXT)
+        width, _pm_x, _pm_y, _text_x, _baseline = self._places()
+        self.setFixedSize(width, self._HEIGHT)
+
+    def _opaque_box(self, pm):
+        if pm.isNull():
+            return (0, 0, self._SLOT - 1, self._SLOT - 1)
+        img = pm.toImage().convertToFormat(QtGui.QImage.Format.Format_ARGB32)
+        left = top = right = bottom = None
+        for y in range(img.height()):
+            for x in range(img.width()):
+                if img.pixelColor(x, y).alpha() > 80:
+                    if top is None:
+                        top = y
+                    bottom = y
+                    if left is None or x < left:
+                        left = x
+                    if right is None or x > right:
+                        right = x
+        if top is None:
+            return (0, 0, max(0, pm.width() - 1), max(0, pm.height() - 1))
+        return (left, top, right, bottom)
+
+    def _places(self):
+        ink = self._ink
+        op_left, op_top, _op_right, op_bottom = self._opaque
+        text_x = -ink.x() if ink.x() < 0 else 0
+        visual_right = text_x + ink.x() + ink.width()
+        pm = self._cookie
+        pm_w = pm.width() if not pm.isNull() else self._SLOT
+        pm_h = pm.height() if not pm.isNull() else self._SLOT
+        pm_x = visual_right + self._GAP - op_left
+        pm_y = (self._HEIGHT - self._SLOT) // 2 + (self._SLOT - pm_h) // 2
+        width = pm_x + pm_w + self._RIGHT
+        opaque_cy = pm_y + (op_top + op_bottom) / 2.0
+        # Середина заглавных, без хвоста «p»: иначе надпись сидит выше печеньки.
+        cap = QtGui.QFontMetrics(self._font).capHeight()
+        baseline = opaque_cy + cap / 2.0
+        return int(width), pm_x, pm_y, text_x, baseline
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.TextAntialiasing, True)
+        _width, pm_x, pm_y, text_x, baseline = self._places()
+        if not self._cookie.isNull():
+            painter.drawPixmap(pm_x, pm_y, self._cookie)
+        painter.setFont(self._font)
+        painter.setPen(QtGui.QColor("#00c8ff" if self.underMouse() else "#d1d1d1"))
+        painter.drawText(QtCore.QPointF(text_x, baseline), self._TEXT)
+
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        self.update()
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        self.update()
+
+
 class ControlPanel(QtWidgets.QWidget):
     def __init__(self, server=None):
         super().__init__()
         self.server = server
         if self.server:
             self.server.newConnection.connect(self.handle_new_connection)
-            
-        self.workers = {}  # {monitor_idx: StealthWorker}
-        self.active_monitors = set()
+
+        self.workers = {}  # {fingerprint_key: StealthWorker}
+        self.active_fps = []  # list of monitor fingerprints (stable across reconnect)
         self.is_boosted = False
         self.is_active = True
         self.is_adjusting = False
-        
+        self._updating_monitors = False
+
         self.settings = QtCore.QSettings("PixelCraft", "DWMfix")
-        self.custom_positions = {}
+        self.custom_positions = {}  # {fingerprint_key or legacy idx: QPoint}
         self.load_settings()
-        
+
         self.init_ui()
         self.init_tray()
-        
+        self.bind_display_events()
+
+        # OLED/power-save can reconnect quietly; reaffirm placement periodically
+        self.placement_timer = QtCore.QTimer(self)
+        self.placement_timer.setInterval(2000)
+        self.placement_timer.timeout.connect(self.reaffirm_workers)
+        self.placement_timer.start()
+
         # Проверка обновлений на старте
-        self.version = "1.2.6"
+        self.version = "1.2.8"
         self.update_thread = UpdateCheckThread(self.version)
         self.update_thread.update_available.connect(self.on_update_available)
         self.update_thread.start()
-        
+
         # Запуск фикса при старте
         self.start_fix()
 
@@ -372,28 +594,8 @@ class ControlPanel(QtWidgets.QWidget):
         btn_test.clicked.connect(self.toggle_test_window)
         layout.addWidget(btn_test)
 
-        # Кнопка Ko-fi (печенька) в правом верхнем углу окна
-        self.btn_coffee = QtWidgets.QPushButton(self)
-        self.btn_coffee.setToolTip("Support development on Ko-fi")
-        self.btn_coffee.setFixedSize(26, 26)
-        self.btn_coffee.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        self.btn_coffee.setStyleSheet("""
-            QPushButton {
-                background-color: transparent;
-                border: none;
-                padding: 0px;
-            }
-            QPushButton:hover {
-                background-color: rgba(255, 255, 255, 0.08);
-                border-radius: 4px;
-            }
-        """)
-        
-        logo_path = get_resource_path("cookielogo.png")
-        if os.path.exists(logo_path):
-            self.btn_coffee.setIcon(QtGui.QIcon(logo_path))
-            self.btn_coffee.setIconSize(QtCore.QSize(22, 22))
-            
+        # Кнопка Ko-fi: печенька на прежнем месте, подпись слева
+        self.btn_coffee = KofiButton(self)
         self.btn_coffee.clicked.connect(lambda: QtGui.QDesktopServices.openUrl(QtCore.QUrl("https://ko-fi.com/pixelcraft404")))
 
         self.setLayout(layout)
@@ -514,57 +716,140 @@ rmdir /s /q "{extract_dir}"
         if self.tray_icon.isVisible():
             self.tray_icon.showMessage("DWM Fixer", "Active (Constant Mode)", QtWidgets.QSystemTrayIcon.MessageIcon.Information, 1500)
 
-    def update_monitor_list(self):
-        self.mon_combo.clear()
+    def bind_display_events(self):
+        app = QtWidgets.QApplication.instance()
+        if app is None:
+            return
+        app.screenAdded.connect(self.on_display_topology_changed)
+        app.screenRemoved.connect(self.on_display_topology_changed)
+        app.primaryScreenChanged.connect(self.on_display_topology_changed)
+        for screen in QtGui.QGuiApplication.screens():
+            self._hook_screen(screen)
+
+    def _hook_screen(self, screen):
+        screen.geometryChanged.connect(self.on_display_topology_changed)
+        screen.availableGeometryChanged.connect(self.on_display_topology_changed)
+
+    def on_display_topology_changed(self, *args):
+        for screen in QtGui.QGuiApplication.screens():
+            try:
+                screen.geometryChanged.disconnect(self.on_display_topology_changed)
+            except TypeError:
+                pass
+            try:
+                screen.availableGeometryChanged.disconnect(self.on_display_topology_changed)
+            except TypeError:
+                pass
+            self._hook_screen(screen)
+
+        # Defer so Windows finishes rearranging virtual desktop coords
+        QtCore.QTimer.singleShot(300, self.refresh_after_display_change)
+        QtCore.QTimer.singleShot(1200, self.refresh_after_display_change)
+
+    def refresh_after_display_change(self):
+        self.update_monitor_list(preserve_selection=True)
+        self.reaffirm_workers()
+
+    def _fp_matches_any_active(self, screen):
+        for fp in self.active_fps:
+            if score_screen_match(fp, screen) >= 25:
+                return True
+        return False
+
+    def _add_active_fp(self, fp):
+        if not fp:
+            return
+        key = fingerprint_key(fp)
+        for existing in self.active_fps:
+            if fingerprint_key(existing) == key:
+                return
+        self.active_fps.append(fp)
+        self.save_active_fps()
+
+    def _remove_active_fp_for_screen(self, screen):
+        self.active_fps = [
+            fp for fp in self.active_fps
+            if score_screen_match(fp, screen) < 25
+        ]
+        self.save_active_fps()
+
+    def save_active_fps(self):
         try:
-            screens = QtGui.QGuiApplication.screens()
+            self.settings.setValue("active_fps", json.dumps(self.active_fps))
+        except Exception:
+            pass
+
+    def update_monitor_list(self, preserve_selection=False):
+        self._updating_monitors = True
+        try:
+            self.mon_combo.clear()
+            screens = list(QtGui.QGuiApplication.screens())
             model = self.mon_combo.model()
+
+            # First run / empty selection: default to non-primary (or only screen)
+            if not self.active_fps and not preserve_selection:
+                primary = QtGui.QGuiApplication.primaryScreen()
+                for i, screen in enumerate(screens):
+                    is_primary = primary is not None and screen is primary
+                    if (not is_primary) or len(screens) == 1:
+                        self._add_active_fp(screen_fingerprint(screen))
+
             for i, screen in enumerate(screens):
-                rect = screen.geometry()
-                ratio = screen.devicePixelRatio()
-                w = int(rect.width() * ratio)
-                h = int(rect.height() * ratio)
-                is_primary = (i == 0)
-                
-                label = f"Display {i + 1} ({w}x{h})"
-                if is_primary:
-                    label += " [Primary]"
-                    
-                item = QtGui.QStandardItem(label)
+                item = QtGui.QStandardItem(screen_label(screen, i))
                 item.setCheckable(True)
-                
-                # По умолчанию выбираем второстепенные мониторы. Если монитор один, то выбираем его.
-                should_check = not is_primary or len(screens) == 1
-                if should_check:
+                item.setData(i, QtCore.Qt.ItemDataRole.UserRole)
+                if self._fp_matches_any_active(screen):
                     item.setCheckState(QtCore.Qt.CheckState.Checked)
-                    self.active_monitors.add(i)
                 else:
                     item.setCheckState(QtCore.Qt.CheckState.Unchecked)
-                    
                 model.appendRow(item)
+
+            if not screens:
+                item = QtGui.QStandardItem("Default Display")
+                item.setCheckable(True)
+                item.setCheckState(QtCore.Qt.CheckState.Checked)
+                model.appendRow(item)
+                if not self.active_fps:
+                    self.active_fps = [{
+                        "name": "Default Display",
+                        "manufacturer": "",
+                        "model": "",
+                        "serial": "",
+                        "w": 0,
+                        "h": 0,
+                    }]
         except Exception:
             model = self.mon_combo.model()
             item = QtGui.QStandardItem("Default Display")
             item.setCheckable(True)
             item.setCheckState(QtCore.Qt.CheckState.Checked)
             model.appendRow(item)
-            self.active_monitors.add(0)
+        finally:
+            self._updating_monitors = False
+            self.mon_combo.update()
 
     def on_monitor_toggled(self, idx, checked):
+        if self._updating_monitors:
+            return
+        screens = list(QtGui.QGuiApplication.screens())
+        if not (0 <= idx < len(screens)):
+            return
+        screen = screens[idx]
+        fp = screen_fingerprint(screen)
         if checked:
-            self.active_monitors.add(idx)
+            self._add_active_fp(fp)
             if self.is_active:
-                self.start_worker_for_monitor(idx)
+                self.start_worker_for_fp(fp, idx)
         else:
-            self.active_monitors.discard(idx)
-            self.stop_worker_for_monitor(idx)
+            self._remove_active_fp_for_screen(screen)
+            self.stop_worker_for_fp(fp)
 
     def load_settings(self):
         # Load boost mode
         val_boost = self.settings.value("is_boosted")
         if val_boost is not None:
             self.is_boosted = (val_boost == 'true' or val_boost is True)
-            
+
         # Load stays on top mode
         val_ontop = self.settings.value("is_ontop")
         if val_ontop is not None:
@@ -572,7 +857,18 @@ rmdir /s /q "{extract_dir}"
         else:
             self.is_ontop = False
 
-        for idx in range(10):  # Поддержка до 10 мониторов
+        # Preferred target monitors (fingerprints) — survive OLED sleep / index shuffle
+        raw_fps = self.settings.value("active_fps")
+        if raw_fps:
+            try:
+                loaded = json.loads(raw_fps)
+                if isinstance(loaded, list):
+                    self.active_fps = [fp for fp in loaded if isinstance(fp, dict)]
+            except Exception:
+                pass
+
+        # Custom positions by fingerprint key; keep legacy index keys for old installs
+        for idx in range(10):
             x_val = self.settings.value(f"Positions/{idx}_x")
             y_val = self.settings.value(f"Positions/{idx}_y")
             if x_val is not None and y_val is not None:
@@ -581,32 +877,130 @@ rmdir /s /q "{extract_dir}"
                 except (ValueError, TypeError):
                     pass
 
-    def on_worker_position_changed(self, idx, pos):
+        self.settings.beginGroup("PositionsByKey")
+        for key in self.settings.childKeys():
+            if key.endswith("_x"):
+                base = key[:-2]
+                x_val = self.settings.value(f"{base}_x")
+                y_val = self.settings.value(f"{base}_y")
+                if x_val is not None and y_val is not None:
+                    try:
+                        self.custom_positions[base] = QtCore.QPoint(int(x_val), int(y_val))
+                    except (ValueError, TypeError):
+                        pass
+        self.settings.endGroup()
+
+    def on_worker_position_changed(self, idx, pos, fp_key=""):
+        if fp_key:
+            self.custom_positions[fp_key] = pos
+            self.settings.setValue(f"PositionsByKey/{fp_key}_x", pos.x())
+            self.settings.setValue(f"PositionsByKey/{fp_key}_y", pos.y())
+        # Legacy index keys (backward compatible)
         self.custom_positions[idx] = pos
         self.settings.setValue(f"Positions/{idx}_x", pos.x())
         self.settings.setValue(f"Positions/{idx}_y", pos.y())
 
-    def start_worker_for_monitor(self, idx):
-        if idx not in self.workers:
-            worker = StealthWorker(idx)
-            worker.set_boost(self.is_boosted)
-            if idx in self.custom_positions:
-                worker.custom_pos = self.custom_positions[idx]
-                worker.move(self.custom_positions[idx])
-            worker.set_draggable(self.is_adjusting)
-            worker.positionChanged.connect(self.on_worker_position_changed)
-            worker.render_timer.start(16)
-            worker.show()
-            worker.raise_()
-            self.workers[idx] = worker
+    def start_worker_for_fp(self, fp, idx=None):
+        key = fingerprint_key(fp)
+        if not key:
+            return
+        if key in self.workers:
+            worker = self.workers[key]
+            if idx is not None:
+                worker.target_monitor_idx = idx
+            worker.target_monitor_fp = fp
+            worker.move_to_monitor()
+            return
 
-    def stop_worker_for_monitor(self, idx):
-        if idx in self.workers:
-            worker = self.workers[idx]
+        if idx is None:
+            _, idx = resolve_screen(fp, 0)
+            if idx < 0:
+                idx = 0
+
+        worker = StealthWorker(idx, fp)
+        worker.set_boost(self.is_boosted)
+        pos = self.custom_positions.get(key)
+        if pos is None:
+            pos = self.custom_positions.get(idx)
+        if pos is not None:
+            worker.custom_pos = pos
+            worker.move(pos)
+        worker.set_draggable(self.is_adjusting)
+        worker.positionChanged.connect(self.on_worker_position_changed)
+        worker.render_timer.start(16)
+        worker.show()
+        worker.raise_()
+        self.workers[key] = worker
+
+    def stop_worker_for_fp(self, fp):
+        key = fingerprint_key(fp)
+        if key in self.workers:
+            worker = self.workers[key]
             worker.render_timer.stop()
             worker.hide()
             worker.deleteLater()
-            del self.workers[idx]
+            del self.workers[key]
+        # Also stop any worker that currently matches this screen identity
+        for wkey, worker in list(self.workers.items()):
+            if worker.target_monitor_fp and fingerprint_key(worker.target_monitor_fp) == key:
+                worker.render_timer.stop()
+                worker.hide()
+                worker.deleteLater()
+                del self.workers[wkey]
+
+    def reaffirm_workers(self):
+        """Re-resolve preferred monitors after sleep/reconnect and keep workers on them."""
+        if not self.is_active:
+            return
+
+        # Desired keys from saved active fingerprints
+        desired_keys = set()
+        for fp in list(self.active_fps):
+            screen, idx = resolve_screen(fp, 0)
+            if screen is None:
+                continue
+            # Only count as online if we matched the preferred panel, or it's a temporary fallback
+            matched = score_screen_match(fp, screen) >= 25
+            if matched:
+                live_fp = screen_fingerprint(screen)
+                # Update stored fp with live fields (name/size may change slightly)
+                key_old = fingerprint_key(fp)
+                key_new = fingerprint_key(live_fp)
+                if key_old != key_new:
+                    self.active_fps = [
+                        live_fp if fingerprint_key(x) == key_old else x
+                        for x in self.active_fps
+                    ]
+                    self.save_active_fps()
+                    if key_old in self.workers and key_new not in self.workers:
+                        self.workers[key_new] = self.workers.pop(key_old)
+                        self.workers[key_new].target_monitor_fp = live_fp
+                desired_keys.add(fingerprint_key(live_fp))
+                self.start_worker_for_fp(live_fp, idx)
+            else:
+                # Preferred offline — keep worker parked on temporary screen if already running
+                key = fingerprint_key(fp)
+                desired_keys.add(key)
+                if key in self.workers:
+                    self.workers[key].move_to_monitor()
+                else:
+                    self.start_worker_for_fp(fp, idx)
+
+        # Drop workers that are no longer preferred
+        for key in list(self.workers.keys()):
+            if key not in desired_keys:
+                worker = self.workers[key]
+                worker.render_timer.stop()
+                worker.hide()
+                worker.deleteLater()
+                del self.workers[key]
+
+        # Nudge remaining workers onto correct geometry
+        for worker in self.workers.values():
+            worker.move_to_monitor()
+            if worker.render_timer.isActive():
+                worker.show()
+                worker.raise_()
 
     def toggle_adjustment(self, state):
         self.is_adjusting = (state == 2)
@@ -678,16 +1072,22 @@ rmdir /s /q "{extract_dir}"
 
     def start_fix(self):
         self.is_active = True
-        for idx in self.active_monitors:
-            self.start_worker_for_monitor(idx)
+        # Ensure defaults if nothing selected yet
+        if not self.active_fps:
+            self.update_monitor_list(preserve_selection=False)
+        self.reaffirm_workers()
         self.status_label.setText("STATUS: ACTIVE")
         self.status_label.setStyleSheet("color: #00c8ff; font-weight: bold;")
         self.btn_toggle.setText("STOP FIX")
 
     def stop_fix(self):
         self.is_active = False
-        for idx in list(self.workers.keys()):
-            self.stop_worker_for_monitor(idx)
+        for key in list(self.workers.keys()):
+            worker = self.workers[key]
+            worker.render_timer.stop()
+            worker.hide()
+            worker.deleteLater()
+            del self.workers[key]
         self.status_label.setText("STATUS: STOPPED")
         self.status_label.setStyleSheet("color: #ff4444; font-weight: bold;")
         self.btn_toggle.setText("START FIX")
