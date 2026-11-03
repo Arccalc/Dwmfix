@@ -1,13 +1,25 @@
 import sys
 import os
 import json
+import ctypes
+import hashlib
+import math
+import random
+import shutil
+import threading
 import winreg
 import win32gui
 import win32api
 import win32con
 import webbrowser
 import tempfile
+from ctypes import wintypes
 from PyQt6 import QtCore, QtGui, QtWidgets, QtNetwork
+
+UPDATE_API_URL = "https://api.github.com/repos/Arccalc/Dwmfix/releases/latest"
+RELEASE_PAGE_URL = "https://github.com/Arccalc/Dwmfix/releases/latest"
+INSTALLER_URL_PREFIX = "https://github.com/Arccalc/Dwmfix/releases/download/"
+UPDATE_TEMP_PREFIX = "dwmfix-update-"
 
 def get_resource_path(relative_path):
     """Возвращает абсолютный путь к ресурсу, учитывая упаковку PyInstaller."""
@@ -16,6 +28,30 @@ def get_resource_path(relative_path):
     except Exception:
         base_path = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_path, relative_path)
+
+
+def load_cookie_pixmap(size):
+    """The logo cookie alone, square and without the soft glow around it."""
+    image = QtGui.QImage(get_resource_path("cookielogo.png"))
+    if image.isNull():
+        body = QtGui.QPixmap(size, size)
+        body.fill(QtCore.Qt.GlobalColor.transparent)
+        painter = QtGui.QPainter(body)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        painter.setBrush(QtGui.QColor("#dd8b42"))
+        painter.drawEllipse(0, 0, size, size)
+        painter.end()
+        return body
+    mask = QtGui.QBitmap.fromImage(image.createAlphaMask(QtCore.Qt.ImageConversionFlag.ThresholdAlphaDither))
+    full = QtGui.QPixmap.fromImage(image)
+    full.setMask(mask)
+    return full.copy(QtGui.QRegion(mask).boundingRect()).scaled(
+        size,
+        size,
+        QtCore.Qt.AspectRatioMode.IgnoreAspectRatio,
+        QtCore.Qt.TransformationMode.SmoothTransformation,
+    )
 
 
 def screen_fingerprint(screen):
@@ -66,8 +102,12 @@ def score_screen_match(fp, screen):
     return score
 
 
-def resolve_screen(preferred_fp, preferred_idx):
-    """Find the preferred screen without blindly clamping index to primary."""
+def resolve_screen(preferred_fp, preferred_idx, allow_fallback=True):
+    """Find the preferred screen without blindly clamping index to primary.
+
+    allow_fallback=False: return nothing when the saved monitor is unplugged.
+    A missing panel must not borrow the laptop.
+    """
     screens = list(QtGui.QGuiApplication.screens())
     if not screens:
         return None, -1
@@ -83,9 +123,14 @@ def resolve_screen(preferred_fp, preferred_idx):
         # Require a meaningful match (not only resolution coincidence alone)
         if best_i >= 0 and best_score >= 25:
             return screens[best_i], best_i
+        if not allow_fallback:
+            return None, -1
 
-    if 0 <= preferred_idx < len(screens):
+    if allow_fallback and 0 <= preferred_idx < len(screens):
         return screens[preferred_idx], preferred_idx
+
+    if not allow_fallback:
+        return None, -1
 
     # Preferred offline: prefer a non-primary screen if any remain
     primary = QtGui.QGuiApplication.primaryScreen()
@@ -94,6 +139,31 @@ def resolve_screen(preferred_fp, preferred_idx):
             return screen, i
 
     return screens[0], 0
+
+
+def claim_screen_indexes(active_fps, screens):
+    """One saved monitor claims at most one connected screen.
+
+    An unplugged entry claims nothing, so its line is not drawn on the laptop.
+    """
+    used = set()
+    claimed = {}
+    for fp in active_fps:
+        if not isinstance(fp, dict):
+            continue
+        best_i = -1
+        best_score = 0
+        for i, screen in enumerate(screens):
+            if i in used:
+                continue
+            score = score_screen_match(fp, screen)
+            if score > best_score:
+                best_score = score
+                best_i = i
+        if best_i >= 0 and best_score >= 25:
+            used.add(best_i)
+            claimed[best_i] = fp
+    return claimed
 
 
 def screen_label(screen, index):
@@ -108,6 +178,267 @@ def screen_label(screen, index):
     primary = QtGui.QGuiApplication.primaryScreen()
     suffix = " [Primary]" if primary is not None and screen is primary else ""
     return f"{pretty} ({w}x{h}){suffix}"
+
+
+def fallback_interval_ms(refresh_hz):
+    """Период запасного таймера, если кадр монитора недоступен."""
+    try:
+        hz = float(refresh_hz)
+    except (TypeError, ValueError):
+        return 16
+    if hz < 40.0:
+        return 16
+    return max(1, int(round(1000.0 / hz)))
+
+
+class _RECT(ctypes.Structure):
+    _fields_ = [
+        ("left", ctypes.c_long),
+        ("top", ctypes.c_long),
+        ("right", ctypes.c_long),
+        ("bottom", ctypes.c_long),
+    ]
+
+
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", _RECT),
+        ("rcWork", _RECT),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", ctypes.c_uint32),
+        ("Data2", ctypes.c_uint16),
+        ("Data3", ctypes.c_uint16),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+
+class _DXGI_OUTPUT_DESC(ctypes.Structure):
+    _fields_ = [
+        ("DeviceName", ctypes.c_wchar * 32),
+        ("DesktopCoordinates", _RECT),
+        ("AttachedToDesktop", wintypes.BOOL),
+        ("Rotation", ctypes.c_uint),
+        ("Monitor", ctypes.c_void_p),
+    ]
+
+
+_HRESULT = ctypes.c_long
+_user32 = ctypes.WinDLL("user32", use_last_error=True)
+_dxgi = ctypes.WinDLL("dxgi", use_last_error=True)
+_ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+
+_MonitorFromWindow = _user32.MonitorFromWindow
+_MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+_MonitorFromWindow.restype = ctypes.c_void_p
+
+_GetMonitorInfoW = _user32.GetMonitorInfoW
+_GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_MONITORINFO)]
+_GetMonitorInfoW.restype = wintypes.BOOL
+
+_CoInitializeEx = _ole32.CoInitializeEx
+_CoInitializeEx.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+_CoInitializeEx.restype = _HRESULT
+
+_CoUninitialize = _ole32.CoUninitialize
+_CoUninitialize.argtypes = []
+_CoUninitialize.restype = None
+
+_IID_IDXGIFactory = _GUID(
+    0x7B7166EC, 0x21C7, 0x44AE,
+    (ctypes.c_ubyte * 8)(0xB2, 0x1A, 0xC9, 0xAE, 0x32, 0x1A, 0xE3, 0x69),
+)
+_CreateDXGIFactory = _dxgi.CreateDXGIFactory
+_CreateDXGIFactory.argtypes = [ctypes.POINTER(_GUID), ctypes.POINTER(ctypes.c_void_p)]
+_CreateDXGIFactory.restype = _HRESULT
+
+# RPC_E_CHANGED_MODE: поток уже в другом апартаменте, свой CoUninitialize не нужен.
+_RPC_E_CHANGED_MODE = 0x80010106
+
+
+def _monitor_from_window(hwnd):
+    if not hwnd:
+        return 0
+    return int(_MonitorFromWindow(hwnd, 2) or 0)
+
+
+def _monitor_rect(hmonitor):
+    info = _MONITORINFO()
+    info.cbSize = ctypes.sizeof(_MONITORINFO)
+    if not _GetMonitorInfoW(ctypes.c_void_p(int(hmonitor)), ctypes.byref(info)):
+        return None
+    rect = info.rcMonitor
+    return (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
+
+
+def _vt(ptr, index, restype, argtypes):
+    obj = ctypes.cast(ptr, ctypes.POINTER(ctypes.c_void_p))
+    table = ctypes.cast(obj[0], ctypes.POINTER(ctypes.c_void_p))
+    return ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)(table[index])
+
+
+def _release(ptr):
+    if ptr:
+        _vt(ptr, 2, ctypes.c_ulong, [])(ptr)
+
+
+def _find_output(factory, hmonitor):
+    """Выход DXGI этого монитора. Чужие выходы сразу отпускаются."""
+    target = _monitor_rect(hmonitor)
+    found = None
+    for adapter_index in range(8):
+        adapter = ctypes.c_void_p()
+        hr = _vt(factory, 7, _HRESULT, [ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p)])(
+            factory, adapter_index, ctypes.byref(adapter)
+        )
+        if hr != 0 or not adapter.value:
+            break
+        try:
+            for output_index in range(8):
+                output = ctypes.c_void_p()
+                hr = _vt(adapter, 7, _HRESULT, [ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p)])(
+                    adapter, output_index, ctypes.byref(output)
+                )
+                if hr != 0 or not output.value:
+                    break
+                desc = _DXGI_OUTPUT_DESC()
+                hr = _vt(output, 7, _HRESULT, [ctypes.POINTER(_DXGI_OUTPUT_DESC)])(
+                    output, ctypes.byref(desc)
+                )
+                rect = (
+                    int(desc.DesktopCoordinates.left),
+                    int(desc.DesktopCoordinates.top),
+                    int(desc.DesktopCoordinates.right),
+                    int(desc.DesktopCoordinates.bottom),
+                )
+                same = hr == 0 and (
+                    int(desc.Monitor or 0) == int(hmonitor) or (target is not None and rect == target)
+                )
+                if same and found is None:
+                    found = output
+                    break
+                _release(output)
+        finally:
+            _release(adapter)
+        if found is not None:
+            break
+    return found
+
+
+class _OutputVBlank:
+    """Ждёт гашение одного монитора. Режим, гамму и профиль не трогает."""
+
+    def __init__(self, hmonitor):
+        self._output = None
+        self._uninit = False
+        self._open(int(hmonitor or 0))
+
+    def ok(self):
+        return self._output is not None
+
+    def wait(self):
+        output = self._output
+        if not output:
+            return False
+        return _vt(output, 10, _HRESULT, [])(output) == 0
+
+    def close(self):
+        output = self._output
+        self._output = None
+        if output:
+            _release(output)
+        if self._uninit:
+            self._uninit = False
+            _CoUninitialize()
+
+    def _open(self, hmonitor):
+        if not hmonitor:
+            return
+        hr = _CoInitializeEx(None, 0)
+        if hr < 0 and (hr & 0xFFFFFFFF) != _RPC_E_CHANGED_MODE:
+            return
+        self._uninit = hr >= 0
+        factory = ctypes.c_void_p()
+        hr = _CreateDXGIFactory(ctypes.byref(_IID_IDXGIFactory), ctypes.byref(factory))
+        if hr != 0 or not factory.value:
+            return
+        try:
+            self._output = _find_output(factory, hmonitor)
+        finally:
+            _release(factory)
+
+
+class VBlankPacer(QtCore.QObject):
+    """Один импульс на каждое обновление того монитора, где лежит окно."""
+
+    fired = QtCore.pyqtSignal()
+    failed = QtCore.pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._gen = 0
+        self._stop = None
+        self._lock = threading.Lock()
+        self.pending = threading.Event()
+
+    def start(self, hwnd):
+        self.stop()
+        self._gen += 1
+        gen = self._gen
+        stop = threading.Event()
+        self._stop = stop
+        threading.Thread(
+            target=self._run,
+            args=(int(hwnd), stop, gen),
+            daemon=True,
+            name="dwmfix-vblank",
+        ).start()
+
+    def stop(self):
+        self._gen += 1
+        stop = self._stop
+        if stop is not None:
+            stop.set()
+        with self._lock:
+            self.pending.clear()
+
+    def _emit(self, signal, stop, gen):
+        with self._lock:
+            if stop.is_set() or gen != self._gen:
+                return
+            if signal is self.fired:
+                self.pending.set()
+            try:
+                signal.emit()
+            except RuntimeError:
+                return
+
+    def _run(self, hwnd, stop, gen):
+        waiter = None
+        try:
+            hmon = _monitor_from_window(hwnd)
+            waiter = _OutputVBlank(hmon)
+            if not waiter.ok():
+                self._emit(self.failed, stop, gen)
+                return
+            while not stop.is_set() and gen == self._gen:
+                if not waiter.wait():
+                    self._emit(self.failed, stop, gen)
+                    return
+                if stop.is_set() or gen != self._gen or self.pending.is_set():
+                    continue
+                self._emit(self.fired, stop, gen)
+        except Exception:
+            self._emit(self.failed, stop, gen)
+        finally:
+            if waiter is not None:
+                waiter.close()
+
 
 class CheckableComboBox(QtWidgets.QComboBox):
     """Выпадающий список с чекбоксами для выбора нескольких мониторов."""
@@ -137,24 +468,20 @@ class CheckableComboBox(QtWidgets.QComboBox):
         super().hidePopup()
 
     def get_display_text(self):
-        checked_texts = []
+        # Name of the checked monitor as in the list ("Mi 27 NFGL", "Display 2"), without
+        # the resolution; a bare list index used to show up for monitors named by model.
+        names = []
         for i in range(self.count()):
             item = self.model().item(i)
             if item and item.checkState() == QtCore.Qt.CheckState.Checked:
-                txt = item.text()
-                if "Display" in txt:
-                    parts = txt.split(" ")
-                    if len(parts) > 1:
-                        checked_texts.append(parts[1])
-                else:
-                    checked_texts.append(str(i))
-        
-        if not checked_texts:
+                names.append(item.text().split(" (")[0])
+
+        if not names:
             return "None"
-        elif len(checked_texts) == 1:
-            return f"Display {checked_texts[0]}"
+        elif len(names) == 1:
+            return names[0]
         else:
-            return f"Displays: {', '.join(checked_texts)}"
+            return f"{names[0]} +{len(names) - 1}"
 
     def paintEvent(self, event):
         painter = QtWidgets.QStylePainter(self)
@@ -194,12 +521,22 @@ class StealthWorker(QtWidgets.QWidget):
 
         self.custom_pos = None
         self.draggable = False
+        self.on_target = False
 
         self.setFixedSize(self.base_width, self.base_height)
 
         self.offset = 0
+        self._pacing = False
+        self._pace_hmon = 0
+        self._pacer = VBlankPacer(self)
+        self._pacer.fired.connect(self._on_vblank)
+        self._pacer.failed.connect(self._on_pace_failed)
         self.render_timer = QtCore.QTimer(self)
-        self.render_timer.timeout.connect(self.repaint)
+        self.render_timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
+        self.render_timer.timeout.connect(self._on_vblank)
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self.stop_pacing)
 
         self.move_to_monitor()
 
@@ -224,6 +561,7 @@ class StealthWorker(QtWidgets.QWidget):
             self.unsetCursor()
         self.update_opacity()
         self.show()
+        self._follow_monitor()
 
     def set_boost(self, enabled):
         self.is_boosted = enabled
@@ -233,36 +571,56 @@ class StealthWorker(QtWidgets.QWidget):
             self.setFixedSize(self.base_width, self.base_height)
         self.move_to_monitor()
 
-    def move_to_monitor(self):
+    def _pin_to_screen(self, screen, x, y):
         try:
-            screen, idx = resolve_screen(self.target_monitor_fp, self.target_monitor_idx)
+            if self.windowHandle() is None:
+                self.create()
+            handle = self.windowHandle()
+            if handle is not None and handle.screen() is not screen:
+                handle.setScreen(screen)
+        except Exception:
+            pass
+        if self.x() != x or self.y() != y:
+            self.move(x, y)
+
+    def move_to_monitor(self):
+        self.on_target = False
+        try:
+            screen, idx = resolve_screen(
+                self.target_monitor_fp,
+                self.target_monitor_idx,
+                allow_fallback=False,
+            )
             if screen is None:
-                self.move(0, 0)
+                self.hide()
                 return
 
-            # Keep index in sync when display order changes after reconnect
-            if self.target_monitor_fp and score_screen_match(self.target_monitor_fp, screen) >= 25:
-                self.target_monitor_idx = idx
-                # Refresh fingerprint fields in case name/size updated
-                self.target_monitor_fp = screen_fingerprint(screen)
+            self.on_target = True
+            self.target_monitor_idx = idx
+            self.target_monitor_fp = screen_fingerprint(screen)
 
             rect = screen.geometry()
             # Keep custom drag position only if it still lands on the target screen
-            if self.custom_pos is not None and rect.contains(self.custom_pos):
-                if self.x() != self.custom_pos.x() or self.y() != self.custom_pos.y():
-                    self.move(self.custom_pos)
-                return
-
             if self.custom_pos is not None and not rect.contains(self.custom_pos):
-                # Topology shifted — drop stale absolute coords
                 self.custom_pos = None
 
-            x = rect.x() + rect.width() // 2 - self.width() // 2
-            y = rect.y() + rect.height() // 2 - self.height() // 2
-            if self.x() != x or self.y() != y:
-                self.move(x, y)
+            if self.custom_pos is not None:
+                x = self.custom_pos.x()
+                y = self.custom_pos.y()
+            else:
+                x = rect.x() + rect.width() // 2 - self.width() // 2
+                y = rect.y() + rect.height() // 2 - self.height() // 2
+
+            # The whole line stays on this screen, including across the shared edge
+            x = max(rect.x(), min(x, rect.x() + rect.width() - self.width()))
+            y = max(rect.y(), min(y, rect.y() + rect.height() - self.height()))
+            self._pin_to_screen(screen, x, y)
         except Exception:
-            self.move(0, 0)
+            self.on_target = False
+            self.hide()
+        finally:
+            if self.on_target:
+                self._follow_monitor()
 
     def mousePressEvent(self, event):
         if self.draggable and event.button() == QtCore.Qt.MouseButton.LeftButton:
@@ -277,8 +635,59 @@ class StealthWorker(QtWidgets.QWidget):
             self.positionChanged.emit(self.target_monitor_idx, new_pos, self.fp_key())
             event.accept()
 
+    def mouseReleaseEvent(self, event):
+        if self.draggable and event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self._follow_monitor()
+        super().mouseReleaseEvent(event)
+
+    def is_pacing(self):
+        return self._pacing
+
+    def _refresh_hz(self):
+        try:
+            screen, _idx = resolve_screen(self.target_monitor_fp, self.target_monitor_idx)
+            if screen is None:
+                return 0.0
+            return float(screen.refreshRate() or 0.0)
+        except Exception:
+            return 0.0
+
+    def start_pacing(self):
+        self._pacing = True
+        self.render_timer.stop()
+        hwnd = int(self.winId() or 0)
+        self._pace_hmon = _monitor_from_window(hwnd) if hwnd else 0
+        if hwnd:
+            self._pacer.start(hwnd)
+        else:
+            self._on_pace_failed()
+
+    def stop_pacing(self):
+        self._pacing = False
+        self._pace_hmon = 0
+        self.render_timer.stop()
+        self._pacer.stop()
+
+    def _follow_monitor(self):
+        if not self._pacing:
+            return
+        hwnd = int(self.winId() or 0)
+        hmon = _monitor_from_window(hwnd) if hwnd else 0
+        if hmon and self._pace_hmon and hmon != self._pace_hmon:
+            self.start_pacing()
+
+    def _on_vblank(self):
+        self._pacer.pending.clear()
+        if self._pacing:
+            self.repaint()
+
+    def _on_pace_failed(self):
+        if not self._pacing or self.render_timer.isActive():
+            return
+        self.render_timer.start(fallback_interval_ms(self._refresh_hz()))
+
     def paintEvent(self, event):
-        if not self.render_timer.isActive():
+        if not self._pacing:
             return
 
         painter = QtGui.QPainter(self)
@@ -299,38 +708,53 @@ class StealthWorker(QtWidgets.QWidget):
             painter.fillRect(self.rect(), gradient)
 
 class UpdateCheckThread(QtCore.QThread):
-    update_available = QtCore.pyqtSignal(str, str)  # (version, download_url)
+    update_available = QtCore.pyqtSignal(str, str, str)  # (version, installer_url, sha256)
 
     def __init__(self, current_version):
         super().__init__()
         self.current_version = current_version
 
     def run(self):
+        self.remove_old_installers()
         try:
             import urllib.request
             import json
-            
-            url = "https://api.github.com/repos/Arccalc/Dwmfix/releases/latest"
-            req = urllib.request.Request(url, headers={"User-Agent": "DWMfix-Updater"})
+
+            req = urllib.request.Request(UPDATE_API_URL, headers={"User-Agent": "DWMfix-Updater"})
             with urllib.request.urlopen(req, timeout=5) as response:
                 if response.status == 200:
                     data = json.loads(response.read().decode('utf-8'))
                     tag_name = data.get("tag_name", "")
                     online_ver = tag_name.strip().lstrip("v")
-                    
+
                     if self.is_newer(online_ver, self.current_version):
-                        assets = data.get("assets", [])
-                        download_url = None
-                        for asset in assets:
-                            if asset.get("name") == "DWMfix.zip":
-                                download_url = asset.get("browser_download_url")
-                                break
-                        if not download_url and assets:
-                            download_url = assets[0].get("browser_download_url")
-                            
-                        if download_url:
-                            self.update_available.emit(online_ver, download_url)
+                        installer_url, sha256 = self.find_installer(data.get("assets", []))
+                        self.update_available.emit(online_ver, installer_url, sha256)
         except Exception:
+            pass
+
+    def find_installer(self, assets):
+        """Only an installer from this repository with a known checksum is offered for installing."""
+        for asset in assets:
+            name = asset.get("name", "")
+            url = asset.get("browser_download_url", "")
+            digest = asset.get("digest") or ""
+            if (
+                name.startswith("DWMfix-Setup-")
+                and name.endswith(".exe")
+                and url.startswith(INSTALLER_URL_PREFIX)
+                and digest.startswith("sha256:")
+            ):
+                return url, digest[len("sha256:"):]
+        return "", ""
+
+    def remove_old_installers(self):
+        try:
+            temp_dir = tempfile.gettempdir()
+            for name in os.listdir(temp_dir):
+                if name.startswith(UPDATE_TEMP_PREFIX):
+                    shutil.rmtree(os.path.join(temp_dir, name), ignore_errors=True)
+        except OSError:
             pass
 
     def is_newer(self, online, current):
@@ -342,141 +766,432 @@ class UpdateCheckThread(QtCore.QThread):
             c_parts += [0] * (max_len - len(c_parts))
             return o_parts > c_parts
         except Exception:
-            return online > current
+            return False
 
 class DownloadUpdateThread(QtCore.QThread):
     progress = QtCore.pyqtSignal(int)
-    finished = QtCore.pyqtSignal(str)  # zip path
+    downloaded = QtCore.pyqtSignal(str)  # installer path
     error = QtCore.pyqtSignal(str)
 
-    def __init__(self, download_url):
+    def __init__(self, download_url, sha256):
         super().__init__()
         self.download_url = download_url
+        self.sha256 = sha256
 
     def run(self):
         try:
             import urllib.request
             req = urllib.request.Request(self.download_url, headers={"User-Agent": "DWMfix-Updater"})
-            with urllib.request.urlopen(req) as response:
+            with urllib.request.urlopen(req, timeout=30) as response:
+                if not response.geturl().startswith("https://"):
+                    raise ValueError("The download was redirected to an insecure address.")
                 total_size = int(response.info().get('Content-Length', 0))
                 bytes_so_far = 0
                 chunk_size = 1024 * 64
-                
-                temp_zip = os.path.join(tempfile.gettempdir(), "dwmfix_update.zip")
-                with open(temp_zip, 'wb') as f:
+                digest = hashlib.sha256()
+
+                # A new private folder: nothing else can have prepared a file at this path.
+                folder = tempfile.mkdtemp(prefix=UPDATE_TEMP_PREFIX)
+                installer = os.path.join(folder, "DWMfix-Setup.exe")
+                with open(installer, 'wb') as f:
                     while True:
+                        if self.isInterruptionRequested():
+                            return
                         chunk = response.read(chunk_size)
                         if not chunk:
                             break
                         f.write(chunk)
+                        digest.update(chunk)
                         bytes_so_far += len(chunk)
                         if total_size > 0:
                             percent = int(bytes_so_far * 100 / total_size)
                             self.progress.emit(percent)
-                
-                self.finished.emit(temp_zip)
+
+            if digest.hexdigest() != self.sha256.lower():
+                shutil.rmtree(folder, ignore_errors=True)
+                raise ValueError("The downloaded file failed its checksum test and was deleted.")
+            if not self.isInterruptionRequested():
+                self.downloaded.emit(installer)
         except Exception as e:
             self.error.emit(str(e))
 
-class KofiButton(QtWidgets.QPushButton):
-    """Печенька на месте прежней кнопки 26×26, подпись слева от неё."""
+class _CookieCanvas(QtWidgets.QWidget):
+    """Paints the cookie over the status box; the mouse goes through to KofiButton."""
 
-    _TEXT = "News & Support"
-    _SLOT = 22
-    _GAP = 5
-    _RIGHT = 2
-    _HEIGHT = 26
-
-    def __init__(self, parent=None):
+    def __init__(self, owner, parent):
         super().__init__(parent)
-        self.setToolTip("Ko-fi: news, updates and support")
-        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        self.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
-        self.setAutoFillBackground(False)
-        self.setStyleSheet(
-            "QPushButton, QPushButton:hover {"
-            "background-color: transparent;"
-            "border: none;"
-            "padding: 0px;"
-            "margin: 0px;"
-            "}"
-        )
-        self._font = QtGui.QFont("Segoe UI")
-        self._font.setPixelSize(11)
-        self._font.setWeight(QtGui.QFont.Weight.Normal)
-        self.setFont(self._font)
-
-        logo_path = get_resource_path("cookielogo.png")
-        self._cookie = QtGui.QPixmap()
-        if os.path.exists(logo_path):
-            self._cookie = QtGui.QPixmap(logo_path).scaled(
-                self._SLOT,
-                self._SLOT,
-                QtCore.Qt.AspectRatioMode.KeepAspectRatio,
-                QtCore.Qt.TransformationMode.SmoothTransformation,
-            )
-        self._opaque = self._opaque_box(self._cookie)
-        self._ink = QtGui.QFontMetrics(self._font).tightBoundingRect(self._TEXT)
-        width, _pm_x, _pm_y, _text_x, _baseline = self._places()
-        self.setFixedSize(width, self._HEIGHT)
-
-    def _opaque_box(self, pm):
-        if pm.isNull():
-            return (0, 0, self._SLOT - 1, self._SLOT - 1)
-        img = pm.toImage().convertToFormat(QtGui.QImage.Format.Format_ARGB32)
-        left = top = right = bottom = None
-        for y in range(img.height()):
-            for x in range(img.width()):
-                if img.pixelColor(x, y).alpha() > 80:
-                    if top is None:
-                        top = y
-                    bottom = y
-                    if left is None or x < left:
-                        left = x
-                    if right is None or x > right:
-                        right = x
-        if top is None:
-            return (0, 0, max(0, pm.width() - 1), max(0, pm.height() - 1))
-        return (left, top, right, bottom)
-
-    def _places(self):
-        ink = self._ink
-        op_left, op_top, _op_right, op_bottom = self._opaque
-        text_x = -ink.x() if ink.x() < 0 else 0
-        visual_right = text_x + ink.x() + ink.width()
-        pm = self._cookie
-        pm_w = pm.width() if not pm.isNull() else self._SLOT
-        pm_h = pm.height() if not pm.isNull() else self._SLOT
-        pm_x = visual_right + self._GAP - op_left
-        pm_y = (self._HEIGHT - self._SLOT) // 2 + (self._SLOT - pm_h) // 2
-        width = pm_x + pm_w + self._RIGHT
-        opaque_cy = pm_y + (op_top + op_bottom) / 2.0
-        # Середина заглавных, без хвоста «p»: иначе надпись сидит выше печеньки.
-        cap = QtGui.QFontMetrics(self._font).capHeight()
-        baseline = opaque_cy + cap / 2.0
-        return int(width), pm_x, pm_y, text_x, baseline
+        self._owner = owner
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
     def paintEvent(self, event):
-        painter = QtGui.QPainter(self)
+        self._owner.paint_on(self)
+
+
+class KofiButton(QtWidgets.QPushButton):
+    """A cookie that rolls out on hover and uncovers its label, then takes a bite of itself.
+
+    A click eats it piece by piece, opens the link, and a new cookie pops up.
+    The button itself is only the hit area, it grows along with the rolled cookie.
+    The timer runs only while something moves, so at rest this costs nothing.
+    """
+
+    activated = QtCore.pyqtSignal()
+
+    _TEXT = "News & Support"
+    _TEXT_COLOR = "#f2a864"
+    _CRUMB_COLORS = ("#dd8b42", "#f2a864", "#4d1f0e")
+    _COOKIE = 18
+    _COOKIE_LIFT = 0.5  # lines its centre up with the capitals of the label
+    _GAP = 6
+    _SLOP = 4
+    # Each bite: turn from the first bite in degrees, then distance from the centre and size in radii.
+    _BITES = (
+        (0.0, 1.0, 0.58),
+        (58.0, 0.95, 0.55),
+        (-58.0, 0.95, 0.55),
+        (18.0, 0.32, 0.6),
+        (200.0, 0.2, 1.1),
+    )
+    _BITE_GROW_S = 0.05
+    _BITE_EVERY_S = 0.13
+    _RESPAWN_WAIT_S = 0.45
+    _POP_S = 0.28
+    _OPEN_DELAY_MS = 500  # lets the eating show before the browser covers the panel
+    _SPRING_OUT = (10.0, 0.6)  # frequency, damping: overshoots and rocks back
+    _SPRING_HOME = (10.0, 0.85)
+    _INTRO_DELAY_MS = 700
+    _INTRO_HOLD_MS = 2200
+    _CANVAS_HEIGHT = 112  # down to the bottom of the status box
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setToolTip("Ko-fi: news, updates and support")
+        self.setAccessibleName(self._TEXT)
+        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+
+        self._font = QtGui.QFont("Segoe UI")
+        self._font.setPixelSize(12)
+        self._font.setWeight(QtGui.QFont.Weight.DemiBold)
+        metrics = QtGui.QFontMetricsF(self._font)
+        self._text_width = metrics.horizontalAdvance(self._TEXT)
+        self._cap_height = metrics.capHeight()
+        self._travel = self._text_width + self._GAP
+
+        self._body = load_cookie_pixmap(self._COOKIE * 8)
+        self._sprite = None
+        self._sprite_dpr = 0.0
+
+        self._right = 0
+        self._row = 0  # vertical centre of the label and the hit area
+        self._cy = 0.0
+        self._hovered = False
+        self._intro = False
+        self._intro_played = False
+        self._p = 0.0  # 0 = at rest, 1 = rolled out
+        self._v = 0.0
+        self._arrived = False
+        self._bite = 0.0  # bites shown, fractional while one grows
+        self._bite_goal = 0
+        self._bite_axis = 0.0
+        self._eating = False
+        self._next_bite_in = 0.0
+        self._respawn_in = 0.0
+        self._pop = 1.0  # 1 = full size, below 1 = a new cookie is popping up
+        self._pop_curve = QtCore.QEasingCurve(QtCore.QEasingCurve.Type.OutBack)
+        self._crumbs = []
+
+        self._clock = QtCore.QElapsedTimer()
+        self._timer = QtCore.QTimer(self)
+        self._timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
+        self._timer.setInterval(8)
+        self._timer.timeout.connect(self._tick)
+        self.clicked.connect(self._chomp)
+
+        self._canvas = _CookieCanvas(self, parent)
+
+    def anchor(self, right, top):
+        """Place the resting cookie by its right and top edges."""
+        self._right = right
+        self._row = top + self._COOKIE // 2
+        self._cy = self._row - self._COOKIE_LIFT
+        self._canvas.setGeometry(0, 0, self.parentWidget().width(), self._CANVAS_HEIGHT)
+        self._sync_hit_area()
+        self.raise_()
+        self._canvas.raise_()
+
+    def _sprite_for(self, dpr):
+        if self._sprite is None or self._sprite_dpr != dpr:
+            # Twice the screen pixels keeps the edge clean while rotating.
+            side = round(self._COOKIE * dpr * 2)
+            self._sprite = self._body.scaled(
+                side,
+                side,
+                QtCore.Qt.AspectRatioMode.IgnoreAspectRatio,
+                QtCore.Qt.TransformationMode.SmoothTransformation,
+            )
+            self._sprite.setDevicePixelRatio(dpr * 2)
+            self._sprite_dpr = dpr
+        return self._sprite
+
+    def _cookie_cx(self):
+        return self._right - self._COOKIE / 2 - self._travel * self._p
+
+    def _angle(self):
+        # A wheel rolling left without slipping turns counter-clockwise.
+        return -math.degrees(self._travel * self._p / (self._COOKIE / 2))
+
+    def _target(self):
+        # A cookie being eaten stays where it is until the new one has popped up.
+        return 1.0 if self._hovered or self._intro or self._eating else 0.0
+
+    def _sync_hit_area(self):
+        left = math.floor(self._cookie_cx() - self._COOKIE / 2 - self._SLOP)
+        if self._target():
+            # Never pull the area out from under a cursor while the cookie rocks back.
+            left = min(left, self.x())
+        side = self._COOKIE + self._SLOP * 2
+        self.setGeometry(left, self._row - side // 2, self._right + self._SLOP - left, side)
+
+    def _animations_on(self):
+        enabled = wintypes.BOOL(True)
+        SPI_GETCLIENTAREAANIMATION = 0x1042
+        ok = ctypes.windll.user32.SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, ctypes.byref(enabled), 0)
+        return not ok or bool(enabled.value)
+
+    def _kick(self):
+        if not self._timer.isActive():
+            self._clock.restart()
+            self._timer.start()
+
+    def _aim(self):
+        if self._animations_on():
+            self._kick()
+            return
+        self._p = self._target()
+        self._v = 0.0
+        self._sync_hit_area()
+        self._canvas.update()
+
+    def _tick(self):
+        dt = min(self._clock.restart() / 1000.0, 0.033)
+        target = self._target()
+
+        freq, damping = self._SPRING_OUT if target else self._SPRING_HOME
+        self._v += (freq * freq * (target - self._p) - 2.0 * damping * freq * self._v) * dt
+        self._p += self._v * dt
+        if self._p < 0.0:
+            # Home is a wall: the cookie taps it and bounces a little.
+            self._p = 0.0
+            self._v *= -0.3
+        settled = abs(self._v) < 0.02 and abs(target - self._p) < 0.002
+        if settled:
+            self._p = target
+            self._v = 0.0
+
+        if target and not self._arrived and self._v <= 0.0 and self._p >= 0.9:
+            # Top of the overshoot: it has rolled in, so it takes its bite.
+            self._arrived = True
+            if not self._bite_goal:
+                self._take_bite()
+        elif self._p < 0.5:
+            self._arrived = False
+
+        if self._eating:
+            self._eat_step(dt)
+        if self._bite < self._bite_goal:
+            self._bite = min(float(self._bite_goal), self._bite + dt / self._BITE_GROW_S)
+        elif self._bite > 0.0 and settled and not target:
+            # The bite heals once the cookie is back home.
+            self._bite_goal = 0
+            self._bite = max(0.0, self._bite - dt / 0.3)
+
+        for crumb in self._crumbs:
+            crumb["vy"] += 420.0 * dt
+            crumb["x"] += crumb["vx"] * dt
+            crumb["y"] += crumb["vy"] * dt
+            crumb["life"] -= dt / 0.6
+        self._crumbs = [crumb for crumb in self._crumbs if crumb["life"] > 0.0]
+
+        self._sync_hit_area()
+        self._canvas.update()
+        # The end of the eating can change where the cookie should go, so ask again.
+        retargeted = self._target() != target
+        busy = self._eating or self._bite != self._bite_goal or (self._bite > 0.0 and not target)
+        if settled and not retargeted and not busy and not self._crumbs:
+            self._timer.stop()
+
+    def _eat_step(self, dt):
+        total = len(self._BITES)
+        if self._pop < 1.0:
+            self._pop = min(1.0, self._pop + dt / self._POP_S)
+            self._eating = self._pop < 1.0
+        elif self._bite_goal < total:
+            self._next_bite_in -= dt
+            if self._next_bite_in <= 0.0:
+                self._take_bite()
+                self._next_bite_in = self._BITE_EVERY_S
+        elif self._bite >= total:
+            self._respawn_in -= dt
+            if self._respawn_in <= 0.0:
+                self._bite = 0.0
+                self._bite_goal = 0
+                self._pop = 0.0
+
+    def _take_bite(self):
+        if not self._bite_goal:
+            # The first bite is always on the top right, wherever the roll left the cookie.
+            self._bite = 0.0
+            self._bite_axis = math.radians(-45.0 - self._angle())
+        turn, reach, _size = self._BITES[self._bite_goal]
+        self._bite_goal += 1
+        on_screen = self._bite_axis + math.radians(turn + self._angle())
+        x = self._cookie_cx() + reach * self._COOKIE / 2 * math.cos(on_screen)
+        y = self._cy + reach * self._COOKIE / 2 * math.sin(on_screen)
+        for _ in range(11 if self._bite_goal == len(self._BITES) else 5):
+            self._crumbs.append({
+                "x": x,
+                "y": y,
+                "vx": random.uniform(-40.0, 55.0),
+                "vy": random.uniform(-95.0, -20.0),
+                "size": random.choice((1.5, 2.0, 2.5)),
+                "color": random.choice(self._CRUMB_COLORS),
+                "life": 1.0,
+            })
+
+    def _chomp(self):
+        if self._eating:
+            return
+        if not self._animations_on():
+            self.activated.emit()
+            return
+        self._eating = True
+        self._arrived = True
+        self._next_bite_in = 0.0
+        self._respawn_in = self._RESPAWN_WAIT_S
+        QtCore.QTimer.singleShot(self._OPEN_DELAY_MS, self.activated.emit)
+        self._kick()
+
+    def _bitten(self, sprite):
+        out = QtGui.QPixmap(sprite)
+        painter = QtGui.QPainter(out)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        painter.setCompositionMode(QtGui.QPainter.CompositionMode.CompositionMode_DestinationOut)
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        painter.setBrush(QtGui.QColor("black"))
+        radius = self._COOKIE / 2
+        center = QtCore.QPointF(radius, radius)
+        for i, (turn, reach, size) in enumerate(self._BITES):
+            grown = min(1.0, self._bite - i)
+            if grown <= 0.0:
+                break
+            a = self._bite_axis + math.radians(turn)
+            mid = center + QtCore.QPointF(math.cos(a), math.sin(a)) * (reach * radius)
+            mouth = radius * size * grown
+            painter.drawEllipse(mid, mouth, mouth)
+            for tooth in (-66.0, -22.0, 22.0, 66.0):  # tooth marks along the edge facing the centre
+                t = a + math.pi + math.radians(tooth)
+                painter.drawEllipse(mid + QtCore.QPointF(math.cos(t), math.sin(t)) * mouth, mouth * 0.3, mouth * 0.3)
+        painter.end()
+        return out
+
+    def paint_on(self, widget):
+        painter = QtGui.QPainter(widget)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
         painter.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform, True)
         painter.setRenderHint(QtGui.QPainter.RenderHint.TextAntialiasing, True)
-        _width, pm_x, pm_y, text_x, baseline = self._places()
-        if not self._cookie.isNull():
-            painter.drawPixmap(pm_x, pm_y, self._cookie)
-        painter.setFont(self._font)
-        painter.setPen(QtGui.QColor("#00c8ff" if self.underMouse() else "#d1d1d1"))
-        painter.drawText(QtCore.QPointF(text_x, baseline), self._TEXT)
+        cx = self._cookie_cx()
+        radius = self._COOKIE / 2
+
+        if self._p > 0.0:
+            # The label shows only behind the cookie.
+            painter.setClipRect(QtCore.QRectF(cx, 0.0, widget.width() - cx, widget.height()))
+            painter.setFont(self._font)
+            painter.setPen(QtGui.QColor(self._TEXT_COLOR))
+            baseline = self._row + self._cap_height / 2
+            painter.drawText(QtCore.QPointF(self._right - self._text_width, baseline), self._TEXT)
+            painter.setClipping(False)
+
+        if self._bite < len(self._BITES):
+            sprite = self._sprite_for(widget.devicePixelRatioF())
+            if self._bite > 0.0:
+                sprite = self._bitten(sprite)
+            painter.save()
+            painter.translate(cx, self._cy)
+            painter.rotate(self._angle())
+            if self._pop < 1.0:
+                scale = self._pop_curve.valueForProgress(self._pop)
+                painter.scale(scale, scale)
+            painter.drawPixmap(
+                QtCore.QRectF(-radius, -radius, self._COOKIE, self._COOKIE),
+                sprite,
+                QtCore.QRectF(sprite.rect()),
+            )
+            painter.restore()
+
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        for crumb in self._crumbs:
+            color = QtGui.QColor(crumb["color"])
+            color.setAlphaF(min(1.0, crumb["life"] * 2.0))
+            painter.setBrush(color)
+            painter.drawRect(QtCore.QRectF(crumb["x"], crumb["y"], crumb["size"], crumb["size"]))
+
+    def paintEvent(self, event):
+        pass
 
     def enterEvent(self, event):
         super().enterEvent(event)
-        self.update()
+        self._hovered = True
+        self._aim()
 
     def leaveEvent(self, event):
         super().leaveEvent(event)
-        self.update()
+        self._hovered = False
+        self._aim()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # One roll on the first opening shows that the label is there.
+        if not self._intro_played:
+            self._intro_played = True
+            if self._animations_on():
+                QtCore.QTimer.singleShot(self._INTRO_DELAY_MS, self._start_intro)
+
+    def _start_intro(self):
+        if self.isVisible():
+            self._intro = True
+            self._aim()
+            QtCore.QTimer.singleShot(self._INTRO_HOLD_MS, self._end_intro)
+
+    def _end_intro(self):
+        self._intro = False
+        self._aim()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._timer.stop()
+        self._hovered = False
+        self._intro = False
+        self._p = 0.0
+        self._v = 0.0
+        self._arrived = False
+        self._bite = 0.0
+        self._bite_goal = 0
+        self._eating = False
+        self._pop = 1.0
+        self._crumbs = []
+        self._sync_hit_area()
 
 
 class ControlPanel(QtWidgets.QWidget):
+    # Fix state: status text, its color, tray message
+    _STATES = {
+        "active": ("STATUS: ACTIVE", "#00c8ff", "Active (Constant Mode)"),
+        "stopped": ("STATUS: STOPPED", "#ff4444", "Stopped. The fix is not running."),
+        "not_connected": ("STATUS: NOT CONNECTED", "#ffb02e", "Waiting. The selected monitor is not connected."),
+        "no_monitor": ("STATUS: NO MONITOR", "#ffb02e", "Waiting. No monitor is selected."),
+    }
+
     def __init__(self, server=None):
         super().__init__()
         self.server = server
@@ -505,10 +1220,13 @@ class ControlPanel(QtWidgets.QWidget):
         self.placement_timer.start()
 
         # Проверка обновлений на старте
-        self.version = "1.2.8"
+        self.version = "1.3.0"
         self.update_thread = UpdateCheckThread(self.version)
         self.update_thread.update_available.connect(self.on_update_available)
         self.update_thread.start()
+
+        # Запись автозагрузки указывает на этот exe, а не на старую сборку
+        self.ensure_startup_targets_self()
 
         # Запуск фикса при старте
         self.start_fix()
@@ -540,6 +1258,7 @@ class ControlPanel(QtWidgets.QWidget):
             }
             QCheckBox { margin: 5px 0; font-weight: 500; }
             #status_box { background-color: #121216; border-radius: 8px; padding: 12px; margin-bottom: 10px; }
+            #status_box QLabel { background: transparent; }
         """)
 
         layout = QtWidgets.QVBoxLayout()
@@ -576,7 +1295,7 @@ class ControlPanel(QtWidgets.QWidget):
         self.boost_check.setChecked(getattr(self, 'is_boosted', False))
         self.boost_check.stateChanged.connect(self.toggle_boost)
         layout.addWidget(self.boost_check)
-        
+
         self.startup_check = QtWidgets.QCheckBox("Start with Windows")
         self.startup_check.setChecked(self.is_startup_enabled())
         self.startup_check.stateChanged.connect(self.toggle_startup)
@@ -594,25 +1313,30 @@ class ControlPanel(QtWidgets.QWidget):
         btn_test.clicked.connect(self.toggle_test_window)
         layout.addWidget(btn_test)
 
-        # Кнопка Ko-fi: печенька на прежнем месте, подпись слева
+        # Ko-fi button: the cookie alone at rest, see KofiButton
         self.btn_coffee = KofiButton(self)
-        self.btn_coffee.clicked.connect(lambda: QtGui.QDesktopServices.openUrl(QtCore.QUrl("https://ko-fi.com/pixelcraft404")))
+        self.btn_coffee.activated.connect(lambda: QtGui.QDesktopServices.openUrl(QtCore.QUrl("https://ko-fi.com/pixelcraft404")))
 
         self.setLayout(layout)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if hasattr(self, 'btn_coffee'):
-            x = self.width() - self.btn_coffee.width() - 10
-            y = 10
-            self.btn_coffee.move(x, y)
-            self.btn_coffee.raise_()
+            # 8 px from the status box edges, the same as its corner radius
+            self.btn_coffee.anchor(self.width() - 19, 19)
 
     def init_tray(self):
         self.tray_icon = QtWidgets.QSystemTrayIcon(self)
-        pix = QtGui.QPixmap(16, 16)
-        pix.fill(QtGui.QColor("#ff4b2b"))
-        self.tray_icon.setIcon(QtGui.QIcon(pix))
+        cookie = load_cookie_pixmap(128)
+        icon = QtGui.QIcon()
+        for side in (16, 20, 24, 32, 40, 48):
+            icon.addPixmap(cookie.scaled(
+                side,
+                side,
+                QtCore.Qt.AspectRatioMode.IgnoreAspectRatio,
+                QtCore.Qt.TransformationMode.SmoothTransformation,
+            ))
+        self.tray_icon.setIcon(icon)
         
         menu = QtWidgets.QMenu()
         menu.addAction("Restore Panel").triggered.connect(self.show_and_raise)
@@ -644,77 +1368,87 @@ class ControlPanel(QtWidgets.QWidget):
             self.restore_from_stealth()
         socket.deleteLater()
 
-    def on_update_available(self, online_ver, download_url):
-        reply = QtWidgets.QMessageBox.question(
-            self,
-            "Update Available",
-            f"A new version of DWM Fixer ({online_ver}) is available.\nWould you like to download and install it now?",
-            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No
-        )
-        if reply == QtWidgets.QMessageBox.StandardButton.Yes:
-            if not getattr(sys, 'frozen', False):
-                QtWidgets.QMessageBox.information(self, "Update", "Auto-update is only supported for the compiled executable version.")
-                return
-            self.start_update_download(download_url)
+    def is_installed_copy(self):
+        # A copy unpacked from the zip has no uninstaller; the installer would put a second copy elsewhere.
+        if not getattr(sys, 'frozen', False):
+            return False
+        return os.path.exists(os.path.join(os.path.dirname(sys.executable), "unins000.exe"))
 
-    def start_update_download(self, url):
+    def on_update_available(self, online_ver, installer_url, sha256):
+        if self.settings.value("skipped_version") == online_ver:
+            return
+        can_install = bool(installer_url) and self.is_installed_copy()
+
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("Update Available")
+        box.setIcon(QtWidgets.QMessageBox.Icon.Information)
+        box.setText(f"A new version of DWM Fixer ({online_ver}) is available.")
+        if can_install:
+            box.setInformativeText("DWM Fixer will close, install the update and start again.")
+        role = QtWidgets.QMessageBox.ButtonRole
+        accept = box.addButton("Install update" if can_install else "Open download page", role.AcceptRole)
+        skip = box.addButton("Skip this version", role.ActionRole)
+        box.addButton("Later", role.RejectRole)
+        box.setDefaultButton(accept)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked == skip:
+            self.settings.setValue("skipped_version", online_ver)
+        elif clicked == accept:
+            if can_install:
+                self.start_update_download(installer_url, sha256)
+            else:
+                self.open_release_page()
+
+    def open_release_page(self):
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl(RELEASE_PAGE_URL))
+
+    def start_update_download(self, url, sha256):
         self.progress_dialog = QtWidgets.QProgressDialog("Downloading update...", "Cancel", 0, 100, self)
         self.progress_dialog.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
         self.progress_dialog.setAutoClose(True)
         self.progress_dialog.show()
 
-        self.download_thread = DownloadUpdateThread(url)
+        self.download_thread = DownloadUpdateThread(url, sha256)
+        self.progress_dialog.canceled.connect(self.download_thread.requestInterruption)
         self.download_thread.progress.connect(self.progress_dialog.setValue)
-        self.download_thread.finished.connect(self.install_update)
+        self.download_thread.downloaded.connect(self.install_update)
         self.download_thread.error.connect(self.on_update_error)
         self.download_thread.start()
 
     def on_update_error(self, err_msg):
         if hasattr(self, 'progress_dialog'):
             self.progress_dialog.close()
-        QtWidgets.QMessageBox.critical(self, "Update Error", f"Failed to download update:\n{err_msg}")
+        reply = QtWidgets.QMessageBox.warning(
+            self,
+            "Update Error",
+            f"The update was not installed:\n{err_msg}\n\nOpen the download page to get it manually?",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No
+        )
+        if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+            self.open_release_page()
 
-    def install_update(self, zip_path):
+    def install_update(self, installer_path):
         if hasattr(self, 'progress_dialog'):
             self.progress_dialog.close()
-            
-        app_dir = os.path.dirname(sys.executable)
-        temp_dir = tempfile.gettempdir()
-        extract_dir = os.path.join(temp_dir, "dwmfix_extract")
-        bat_path = os.path.join(temp_dir, "dwmfix_updater.bat")
-        
-        bat_content = f"""@echo off
-timeout /t 2 /nobreak > nul
-powershell -Command "Expand-Archive -Path '{zip_path}' -DestinationPath '{extract_dir}' -Force"
-
-if exist "{extract_dir}\\DWMfix" (
-    xcopy /y /e /q "{extract_dir}\\DWMfix\\*" "{app_dir}"
-) else (
-    xcopy /y /e /q "{extract_dir}\\*" "{app_dir}"
-)
-
-start "" "{os.path.join(app_dir, "DWMfix.exe")}"
-del /f /q "{zip_path}"
-rmdir /s /q "{extract_dir}"
-(goto) 2>nul & del "%~f0"
-"""
         try:
-            with open(bat_path, "w", encoding="utf-8") as f:
-                f.write(bat_content)
-                
             import subprocess
+            # The new copy is started by the installer and must not inherit this process's bundle paths.
+            env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")
             subprocess.Popen(
-                [bat_path],
-                creationflags=subprocess.CREATE_NEW_CONSOLE | subprocess.DETACHED_PROCESS if sys.platform == "win32" else 0
+                [installer_path, "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS"],
+                cwd=os.path.dirname(installer_path),
+                env=env,
             )
             QtWidgets.QApplication.quit()
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Update Error", f"Failed to start updater:\n{str(e)}")
+        except OSError as e:
+            self.on_update_error(str(e))
 
     def hide_to_tray(self):
         self.hide()
         if self.tray_icon.isVisible():
-            self.tray_icon.showMessage("DWM Fixer", "Active (Constant Mode)", QtWidgets.QSystemTrayIcon.MessageIcon.Information, 1500)
+            self.tray_icon.showMessage("DWM Fixer", self.status_message(), QtWidgets.QSystemTrayIcon.MessageIcon.Information, 1500)
 
     def bind_display_events(self):
         app = QtWidgets.QApplication.instance()
@@ -749,12 +1483,6 @@ rmdir /s /q "{extract_dir}"
     def refresh_after_display_change(self):
         self.update_monitor_list(preserve_selection=True)
         self.reaffirm_workers()
-
-    def _fp_matches_any_active(self, screen):
-        for fp in self.active_fps:
-            if score_screen_match(fp, screen) >= 25:
-                return True
-        return False
 
     def _add_active_fp(self, fp):
         if not fp:
@@ -794,11 +1522,12 @@ rmdir /s /q "{extract_dir}"
                     if (not is_primary) or len(screens) == 1:
                         self._add_active_fp(screen_fingerprint(screen))
 
+            claimed = claim_screen_indexes(self.active_fps, screens)
             for i, screen in enumerate(screens):
                 item = QtGui.QStandardItem(screen_label(screen, i))
                 item.setCheckable(True)
                 item.setData(i, QtCore.Qt.ItemDataRole.UserRole)
-                if self._fp_matches_any_active(screen):
+                if i in claimed:
                     item.setCheckState(QtCore.Qt.CheckState.Checked)
                 else:
                     item.setCheckState(QtCore.Qt.CheckState.Unchecked)
@@ -843,6 +1572,7 @@ rmdir /s /q "{extract_dir}"
         else:
             self._remove_active_fp_for_screen(screen)
             self.stop_worker_for_fp(fp)
+        self.update_status()
 
     def load_settings(self):
         # Load boost mode
@@ -913,9 +1643,9 @@ rmdir /s /q "{extract_dir}"
             return
 
         if idx is None:
-            _, idx = resolve_screen(fp, 0)
+            _screen, idx = resolve_screen(fp, -1, allow_fallback=False)
             if idx < 0:
-                idx = 0
+                return
 
         worker = StealthWorker(idx, fp)
         worker.set_boost(self.is_boosted)
@@ -924,11 +1654,15 @@ rmdir /s /q "{extract_dir}"
             pos = self.custom_positions.get(idx)
         if pos is not None:
             worker.custom_pos = pos
-            worker.move(pos)
+        worker.move_to_monitor()
+        if not worker.on_target:
+            worker.hide()
+            worker.deleteLater()
+            return
         worker.set_draggable(self.is_adjusting)
         worker.positionChanged.connect(self.on_worker_position_changed)
-        worker.render_timer.start(16)
         worker.show()
+        worker.start_pacing()
         worker.raise_()
         self.workers[key] = worker
 
@@ -936,14 +1670,14 @@ rmdir /s /q "{extract_dir}"
         key = fingerprint_key(fp)
         if key in self.workers:
             worker = self.workers[key]
-            worker.render_timer.stop()
+            worker.stop_pacing()
             worker.hide()
             worker.deleteLater()
             del self.workers[key]
         # Also stop any worker that currently matches this screen identity
         for wkey, worker in list(self.workers.items()):
             if worker.target_monitor_fp and fingerprint_key(worker.target_monitor_fp) == key:
-                worker.render_timer.stop()
+                worker.stop_pacing()
                 worker.hide()
                 worker.deleteLater()
                 del self.workers[wkey]
@@ -953,44 +1687,31 @@ rmdir /s /q "{extract_dir}"
         if not self.is_active:
             return
 
-        # Desired keys from saved active fingerprints
+        # Линия только на экране, который реально совпал с сохранённым. Отключённый монитор не занимает ноутбук.
         desired_keys = set()
-        for fp in list(self.active_fps):
-            screen, idx = resolve_screen(fp, 0)
-            if screen is None:
-                continue
-            # Only count as online if we matched the preferred panel, or it's a temporary fallback
-            matched = score_screen_match(fp, screen) >= 25
-            if matched:
-                live_fp = screen_fingerprint(screen)
-                # Update stored fp with live fields (name/size may change slightly)
-                key_old = fingerprint_key(fp)
-                key_new = fingerprint_key(live_fp)
-                if key_old != key_new:
-                    self.active_fps = [
-                        live_fp if fingerprint_key(x) == key_old else x
-                        for x in self.active_fps
-                    ]
-                    self.save_active_fps()
-                    if key_old in self.workers and key_new not in self.workers:
-                        self.workers[key_new] = self.workers.pop(key_old)
-                        self.workers[key_new].target_monitor_fp = live_fp
-                desired_keys.add(fingerprint_key(live_fp))
-                self.start_worker_for_fp(live_fp, idx)
-            else:
-                # Preferred offline — keep worker parked on temporary screen if already running
-                key = fingerprint_key(fp)
-                desired_keys.add(key)
-                if key in self.workers:
-                    self.workers[key].move_to_monitor()
-                else:
-                    self.start_worker_for_fp(fp, idx)
+        screens = list(QtGui.QGuiApplication.screens())
+        for idx, fp in claim_screen_indexes(self.active_fps, screens).items():
+            screen = screens[idx]
+            live_fp = screen_fingerprint(screen)
+            key_old = fingerprint_key(fp)
+            key_new = fingerprint_key(live_fp)
+            if key_old != key_new:
+                self.active_fps = [
+                    live_fp if fingerprint_key(x) == key_old else x
+                    for x in self.active_fps
+                ]
+                self.save_active_fps()
+                if key_old in self.workers and key_new not in self.workers:
+                    self.workers[key_new] = self.workers.pop(key_old)
+                    self.workers[key_new].target_monitor_fp = live_fp
+            desired_keys.add(key_new)
+            self.start_worker_for_fp(live_fp, idx)
 
         # Drop workers that are no longer preferred
         for key in list(self.workers.keys()):
             if key not in desired_keys:
                 worker = self.workers[key]
-                worker.render_timer.stop()
+                worker.stop_pacing()
                 worker.hide()
                 worker.deleteLater()
                 del self.workers[key]
@@ -998,9 +1719,13 @@ rmdir /s /q "{extract_dir}"
         # Nudge remaining workers onto correct geometry
         for worker in self.workers.values():
             worker.move_to_monitor()
-            if worker.render_timer.isActive():
+            if not worker.on_target:
+                worker.hide()
+            elif worker.is_pacing():
                 worker.show()
                 worker.raise_()
+
+        self.update_status()
 
     def toggle_adjustment(self, state):
         self.is_adjusting = (state == 2)
@@ -1013,41 +1738,87 @@ rmdir /s /q "{extract_dir}"
         for worker in self.workers.values():
             worker.set_boost(self.is_boosted)
 
-    def is_startup_enabled(self):
+    def _startup_command(self):
+        if getattr(sys, "frozen", False):
+            return f'"{os.path.abspath(sys.executable)}" --startup'
+        script_path = os.path.abspath(sys.argv[0])
+        return f'"{sys.executable}" "{script_path}" --startup'
+
+    def _read_startup_command(self):
         try:
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
-            value, _ = winreg.QueryValueEx(key, "DWMfix")
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                0,
+                winreg.KEY_READ,
+            )
+            try:
+                value, _ = winreg.QueryValueEx(key, "DWMfix")
+            finally:
+                winreg.CloseKey(key)
+            return value
+        except OSError:
+            return None
+
+    def _clear_startup_approval(self):
+        try:
+            approve_key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run",
+                0,
+                winreg.KEY_SET_VALUE,
+            )
+            try:
+                winreg.DeleteValue(approve_key, "DWMfix")
+            finally:
+                winreg.CloseKey(approve_key)
+        except OSError:
+            pass
+
+    def _write_startup_command(self, command):
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            0,
+            winreg.KEY_SET_VALUE,
+        )
+        try:
+            winreg.SetValueEx(key, "DWMfix", 0, winreg.REG_SZ, command)
+        finally:
             winreg.CloseKey(key)
-            return True
-        except WindowsError:
-            return False
+        self._clear_startup_approval()
+
+    def is_startup_enabled(self):
+        return self._read_startup_command() is not None
+
+    def ensure_startup_targets_self(self):
+        """Если автозагрузка включена, в реестре должен быть путь этого exe."""
+        current = self._read_startup_command()
+        if not current:
+            return
+        desired = self._startup_command()
+        if current != desired:
+            try:
+                self._write_startup_command(desired)
+            except OSError:
+                pass
 
     def toggle_startup(self, state):
         key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
-        
-        if getattr(sys, 'frozen', False):
-            exe_path = f'"{sys.executable}" --startup'
-        else:
-            script_path = os.path.abspath(sys.argv[0])
-            exe_path = f'"{sys.executable}" "{script_path}" --startup'
-            
         try:
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_ALL_ACCESS)
-            if state == 2:
-                winreg.SetValueEx(key, "DWMfix", 0, winreg.REG_SZ, exe_path)
-                try:
-                    approve_key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run", 0, winreg.KEY_ALL_ACCESS)
-                    winreg.DeleteValue(approve_key, "DWMfix")
-                    winreg.CloseKey(approve_key)
-                except Exception:
-                    pass
-            else:
-                try:
-                    winreg.DeleteValue(key, "DWMfix")
-                except FileNotFoundError:
-                    pass
-            winreg.CloseKey(key)
-        except Exception:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
+            try:
+                if state == 2:
+                    winreg.SetValueEx(key, "DWMfix", 0, winreg.REG_SZ, self._startup_command())
+                    self._clear_startup_approval()
+                else:
+                    try:
+                        winreg.DeleteValue(key, "DWMfix")
+                    except FileNotFoundError:
+                        pass
+            finally:
+                winreg.CloseKey(key)
+        except OSError:
             pass
 
     def show_and_raise(self):
@@ -1076,21 +1847,35 @@ rmdir /s /q "{extract_dir}"
         if not self.active_fps:
             self.update_monitor_list(preserve_selection=False)
         self.reaffirm_workers()
-        self.status_label.setText("STATUS: ACTIVE")
-        self.status_label.setStyleSheet("color: #00c8ff; font-weight: bold;")
+        self.update_status()
         self.btn_toggle.setText("STOP FIX")
 
     def stop_fix(self):
         self.is_active = False
         for key in list(self.workers.keys()):
             worker = self.workers[key]
-            worker.render_timer.stop()
+            worker.stop_pacing()
             worker.hide()
             worker.deleteLater()
             del self.workers[key]
-        self.status_label.setText("STATUS: STOPPED")
-        self.status_label.setStyleSheet("color: #ff4444; font-weight: bold;")
+        self.update_status()
         self.btn_toggle.setText("START FIX")
+
+    def _fix_state(self):
+        if not self.is_active:
+            return "stopped"
+        if any(worker.on_target and worker.is_pacing() for worker in self.workers.values()):
+            return "active"
+        return "not_connected" if self.active_fps else "no_monitor"
+
+    def update_status(self):
+        text, color, _message = self._STATES[self._fix_state()]
+        if self.status_label.text() != text:
+            self.status_label.setText(text)
+            self.status_label.setStyleSheet(f"color: {color}; font-size: 15px; font-weight: bold;")
+
+    def status_message(self):
+        return self._STATES[self._fix_state()][2]
 
     def toggle_test_window(self):
         html_content = """<!DOCTYPE html>
@@ -1375,6 +2160,6 @@ if __name__ == "__main__":
         panel.show()
     else:
         if panel.tray_icon.isVisible():
-            panel.tray_icon.showMessage("DWM Fixer", "Started with Windows. Active in background.", QtWidgets.QSystemTrayIcon.MessageIcon.Information, 1500)
+            panel.tray_icon.showMessage("DWM Fixer", f"Started with Windows. {panel.status_message()}", QtWidgets.QSystemTrayIcon.MessageIcon.Information, 1500)
     
     sys.exit(app.exec())
